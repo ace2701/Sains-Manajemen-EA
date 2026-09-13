@@ -1,0 +1,778 @@
+//+------------------------------------------------------------------+
+//|                                                   EA-11_BBands.mq5|
+//|                    Bollinger Bands Rejection Expert Advisor       |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-11 - Bollinger Bands Rejection"
+#property description "Trades rejection from the outer Bollinger Bands."
+
+#include <Trade/Trade.mqh>
+
+//--- General
+input long   MagicNumber            = 9011;
+input double LotSize                = 0.10;
+input int    MaxSpreadPoints        = 50;
+
+//--- Bollinger Bands
+input int    BB_Period              = 20;
+input double BB_Deviation           = 2.0;
+
+//--- Entry Filter
+input bool   UseBodyFilter          = true;
+input double MinimumBodyPercent     = 10.0;
+
+//--- Stop Loss
+input int    StopBufferPoints       = 50;
+input int    MaxStopLossPoints      = 500;
+
+//--- Take Profit
+input bool   UseMiddleBandTP        = true;
+input double FallbackRiskReward     = 1.5;
+
+//--- Optional Band Width
+input bool   UseBandWidthFilter     = false;
+input int    MinimumBandWidthPoints = 100;
+
+//--- Trading Hours
+input bool   UseTradingHours        = false;
+input int    StartHour              = 0;
+input int    EndHour                = 23;
+
+//--- Global objects/variables
+CTrade   trade;
+int      bbHandle = INVALID_HANDLE;
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(BB_Period < 2)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(BB_Deviation <= 0.0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(LotSize <= 0.0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(MaxSpreadPoints < 0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(StopBufferPoints < 0 || MaxStopLossPoints <= 0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(FallbackRiskReward <= 0.0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(MinimumBodyPercent < 0.0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(MinimumBandWidthPoints < 0)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   if(StartHour < 0 || StartHour > 23 ||
+      EndHour < 0 || EndHour > 23)
+      return(INIT_PARAMETERS_INCORRECT);
+
+   //--- Create Bollinger Bands handle
+   bbHandle = iBands(
+      _Symbol,
+      PERIOD_CURRENT,
+      BB_Period,
+      0,
+      BB_Deviation,
+      PRICE_CLOSE
+   );
+
+   if(bbHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create Bollinger Bands handle. Error: ",
+            GetLastError());
+      return(INIT_FAILED);
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   //--- Initialize bar tracking
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(bbHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(bbHandle);
+      bbHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   if(Bars(_Symbol, PERIOD_CURRENT) < BB_Period + 5)
+      return;
+
+   if(HasOpenPosition())
+      return;
+
+   if(!IsTradingTime())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   double middleBand = 0.0;
+   double upperBand  = 0.0;
+   double lowerBand  = 0.0;
+
+   if(!GetBollingerValues(middleBand, upperBand, lowerBand))
+      return;
+
+   //--- Closed candle only: bar 1
+   const double openPrice  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   const double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+   const double highPrice  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   const double lowPrice   = iLow(_Symbol, PERIOD_CURRENT, 1);
+
+   if(openPrice == 0.0 || closePrice == 0.0 ||
+      highPrice == 0.0 || lowPrice == 0.0)
+      return;
+
+   //--- Optional band-width filter
+   if(UseBandWidthFilter)
+   {
+      const double bandWidth = upperBand - lowerBand;
+
+      if(bandWidth < (double)MinimumBandWidthPoints * _Point)
+         return;
+   }
+
+   //--- BUY rejection
+   if(IsBullishRejection(
+      openPrice,
+      closePrice,
+      lowPrice,
+      lowerBand,
+      upperBand
+   ))
+   {
+      OpenBuy(middleBand, lowerBand);
+      return;
+   }
+
+   //--- SELL rejection
+   if(IsBearishRejection(
+      openPrice,
+      closePrice,
+      highPrice,
+      upperBand,
+      lowerBand
+   ))
+   {
+      OpenSell(middleBand, upperBand);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect a newly opened bar                                        |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   const datetime currentBarTime =
+      iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return(false);
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return(true);
+   }
+
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Get Bollinger Band values for closed candle                      |
+//+------------------------------------------------------------------+
+bool GetBollingerValues(
+   double &middleBand,
+   double &upperBand,
+   double &lowerBand
+)
+{
+   if(bbHandle == INVALID_HANDLE)
+      return(false);
+
+   double middle[1];
+   double upper[1];
+   double lower[1];
+
+   //--- Copy only bar 1. This guarantees closed-candle data.
+   if(CopyBuffer(bbHandle, 0, 1, 1, middle) != 1)
+      return(false);
+
+   if(CopyBuffer(bbHandle, 1, 1, 1, upper) != 1)
+      return(false);
+
+   if(CopyBuffer(bbHandle, 2, 1, 1, lower) != 1)
+      return(false);
+
+   middleBand = middle[0];
+   upperBand  = upper[0];
+   lowerBand  = lower[0];
+
+   if(middleBand <= 0.0 ||
+      upperBand <= 0.0 ||
+      lowerBand <= 0.0)
+      return(false);
+
+   if(upperBand <= lowerBand)
+      return(false);
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Check bullish Bollinger rejection                                |
+//+------------------------------------------------------------------+
+bool IsBullishRejection(
+   const double openPrice,
+   const double closePrice,
+   const double lowPrice,
+   const double lowerBand,
+   const double upperBand
+)
+{
+   //--- Price touched/broke lower band
+   if(lowPrice > lowerBand)
+      return(false);
+
+   //--- Candle closed back inside the band
+   if(closePrice <= lowerBand)
+      return(false);
+
+   //--- Bullish candle
+   if(closePrice <= openPrice)
+      return(false);
+
+   if(UseBodyFilter)
+   {
+      const double body = MathAbs(closePrice - openPrice);
+      const double bandWidth = upperBand - lowerBand;
+
+      if(bandWidth <= 0.0)
+         return(false);
+
+      const double minimumBody =
+         bandWidth * MinimumBodyPercent / 100.0;
+
+      if(body < minimumBody)
+         return(false);
+   }
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Check bearish Bollinger rejection                                |
+//+------------------------------------------------------------------+
+bool IsBearishRejection(
+   const double openPrice,
+   const double closePrice,
+   const double highPrice,
+   const double upperBand,
+   const double lowerBand
+)
+{
+   //--- Price touched/broke upper band
+   if(highPrice < upperBand)
+      return(false);
+
+   //--- Candle closed back inside the band
+   if(closePrice >= upperBand)
+      return(false);
+
+   //--- Bearish candle
+   if(closePrice >= openPrice)
+      return(false);
+
+   if(UseBodyFilter)
+   {
+      const double body = MathAbs(closePrice - openPrice);
+      const double bandWidth = upperBand - lowerBand;
+
+      if(bandWidth <= 0.0)
+         return(false);
+
+      const double minimumBody =
+         bandWidth * MinimumBodyPercent / 100.0;
+
+      if(body < minimumBody)
+         return(false);
+   }
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Check whether EA already has an open position                    |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   const int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      const string symbol =
+         PositionGetString(POSITION_SYMBOL);
+
+      const long magic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return(true);
+   }
+
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Spread filter                                                    |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return(false);
+
+   const double spreadPoints =
+      (tick.ask - tick.bid) / _Point;
+
+   return(spreadPoints <= (double)MaxSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| Trading-hour filter                                              |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return(true);
+
+   MqlDateTime currentTime;
+
+   if(!TimeToStruct(TimeCurrent(), currentTime))
+      return(false);
+
+   const int hour = currentTime.hour;
+
+   //--- Same hour means only that exact hour is active.
+   if(StartHour == EndHour)
+      return(hour == StartHour);
+
+   //--- Normal intraday interval
+   if(StartHour < EndHour)
+      return(hour >= StartHour && hour <= EndHour);
+
+   //--- Overnight interval, e.g. 22 -> 5
+   return(hour >= StartHour || hour <= EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate normalized lot size                                    |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+   double minVolume = 0.0;
+   double maxVolume = 0.0;
+   double stepVolume = 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN, minVolume))
+      return(0.0);
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX, maxVolume))
+      return(0.0);
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP, stepVolume))
+      return(0.0);
+
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      stepVolume <= 0.0)
+      return(0.0);
+
+   double volume = LotSize;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   if(volume > maxVolume)
+      volume = maxVolume;
+
+   volume = MathFloor(volume / stepVolume) * stepVolume;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   if(volume > maxVolume)
+      volume = maxVolume;
+
+   return(NormalizeVolume(volume, stepVolume));
+}
+
+//+------------------------------------------------------------------+
+//| Normalize volume according to broker step                        |
+//+------------------------------------------------------------------+
+double NormalizeVolume(
+   const double volume,
+   const double step
+)
+{
+   if(step <= 0.0)
+      return(volume);
+
+   int digits = 0;
+   double temp = step;
+
+   while(digits < 8 && MathAbs(temp - MathRound(temp)) > 0.00000001)
+   {
+      temp *= 10.0;
+      digits++;
+   }
+
+   return(NormalizeDouble(volume, digits));
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   return(NormalizeDouble(price, _Digits));
+}
+
+//+------------------------------------------------------------------+
+//| Get broker minimum stop distance in price                        |
+//+------------------------------------------------------------------+
+double GetMinimumStopDistance()
+{
+   const long stopsLevel =
+      SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+
+   if(stopsLevel < 0)
+      return(0.0);
+
+   return((double)stopsLevel * _Point);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Bollinger-based BUY stop loss                          |
+//+------------------------------------------------------------------+
+double CalculateBuyStopLoss(
+   const double lowerBand,
+   const double entryPrice
+)
+{
+   const double sl =
+      lowerBand - (double)StopBufferPoints * _Point;
+
+   const double risk =
+      entryPrice - sl;
+
+   if(risk <= 0.0)
+      return(0.0);
+
+   if(risk > (double)MaxStopLossPoints * _Point)
+      return(0.0);
+
+   return(NormalizePrice(sl));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Bollinger-based SELL stop loss                         |
+//+------------------------------------------------------------------+
+double CalculateSellStopLoss(
+   const double upperBand,
+   const double entryPrice
+)
+{
+   const double sl =
+      upperBand + (double)StopBufferPoints * _Point;
+
+   const double risk =
+      sl - entryPrice;
+
+   if(risk <= 0.0)
+      return(0.0);
+
+   if(risk > (double)MaxStopLossPoints * _Point)
+      return(0.0);
+
+   return(NormalizePrice(sl));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate BUY take profit                                        |
+//+------------------------------------------------------------------+
+double CalculateBuyTakeProfit(
+   const double entryPrice,
+   const double stopLoss,
+   const double middleBand
+)
+{
+   const double minimumDistance =
+      GetMinimumStopDistance();
+
+   //--- Try Bollinger middle-band target first
+   if(UseMiddleBandTP)
+   {
+      const double middleTP =
+         NormalizePrice(middleBand);
+
+      if(middleTP > entryPrice &&
+         (middleTP - entryPrice) >= minimumDistance)
+      {
+         return(middleTP);
+      }
+   }
+
+   //--- Fallback risk/reward target
+   const double risk =
+      entryPrice - stopLoss;
+
+   if(risk <= 0.0)
+      return(0.0);
+
+   const double fallbackTP =
+      entryPrice + risk * FallbackRiskReward;
+
+   if(fallbackTP <= entryPrice)
+      return(0.0);
+
+   if((fallbackTP - entryPrice) < minimumDistance)
+      return(0.0);
+
+   return(NormalizePrice(fallbackTP));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate SELL take profit                                       |
+//+------------------------------------------------------------------+
+double CalculateSellTakeProfit(
+   const double entryPrice,
+   const double stopLoss,
+   const double middleBand
+)
+{
+   const double minimumDistance =
+      GetMinimumStopDistance();
+
+   //--- Try Bollinger middle-band target first
+   if(UseMiddleBandTP)
+   {
+      const double middleTP =
+         NormalizePrice(middleBand);
+
+      if(middleTP < entryPrice &&
+         (entryPrice - middleTP) >= minimumDistance)
+      {
+         return(middleTP);
+      }
+   }
+
+   //--- Fallback risk/reward target
+   const double risk =
+      stopLoss - entryPrice;
+
+   if(risk <= 0.0)
+      return(0.0);
+
+   const double fallbackTP =
+      entryPrice - risk * FallbackRiskReward;
+
+   if(fallbackTP >= entryPrice)
+      return(0.0);
+
+   if((entryPrice - fallbackTP) < minimumDistance)
+      return(0.0);
+
+   return(NormalizePrice(fallbackTP));
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY position                                                |
+//+------------------------------------------------------------------+
+void OpenBuy(
+   const double middleBand,
+   const double lowerBand
+)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   const double entryPrice =
+      NormalizePrice(tick.ask);
+
+   const double stopLoss =
+      CalculateBuyStopLoss(lowerBand, entryPrice);
+
+   if(stopLoss <= 0.0)
+      return;
+
+   const double minimumDistance =
+      GetMinimumStopDistance();
+
+   //--- SL must be below current Ask by broker minimum distance
+   if((entryPrice - stopLoss) < minimumDistance)
+      return;
+
+   const double takeProfit =
+      CalculateBuyTakeProfit(
+         entryPrice,
+         stopLoss,
+         middleBand
+      );
+
+   if(takeProfit <= 0.0)
+      return;
+
+   //--- Final validation
+   if(stopLoss >= entryPrice)
+      return;
+
+   if(takeProfit <= entryPrice)
+      return;
+
+   const double volume =
+      CalculateLotSize();
+
+   if(volume <= 0.0)
+      return;
+
+   ResetLastError();
+
+   const bool result =
+      trade.Buy(
+         volume,
+         _Symbol,
+         entryPrice,
+         stopLoss,
+         takeProfit,
+         "EA-11 BB Rejection BUY"
+      );
+
+   if(!result)
+   {
+      Print(
+         "EA-11 BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL position                                               |
+//+------------------------------------------------------------------+
+void OpenSell(
+   const double middleBand,
+   const double upperBand
+)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   const double entryPrice =
+      NormalizePrice(tick.bid);
+
+   const double stopLoss =
+      CalculateSellStopLoss(upperBand, entryPrice);
+
+   if(stopLoss <= 0.0)
+      return;
+
+   const double minimumDistance =
+      GetMinimumStopDistance();
+
+   //--- SL must be above current Bid by broker minimum distance
+   if((stopLoss - entryPrice) < minimumDistance)
+      return;
+
+   const double takeProfit =
+      CalculateSellTakeProfit(
+         entryPrice,
+         stopLoss,
+         middleBand
+      );
+
+   if(takeProfit <= 0.0)
+      return;
+
+   //--- Final validation
+   if(stopLoss <= entryPrice)
+      return;
+
+   if(takeProfit >= entryPrice)
+      return;
+
+   const double volume =
+      CalculateLotSize();
+
+   if(volume <= 0.0)
+      return;
+
+   ResetLastError();
+
+   const bool result =
+      trade.Sell(
+         volume,
+         _Symbol,
+         entryPrice,
+         stopLoss,
+         takeProfit,
+         "EA-11 BB Rejection SELL"
+      );
+
+   if(!result)
+   {
+      Print(
+         "EA-11 SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+//+------------------------------------------------------------------+

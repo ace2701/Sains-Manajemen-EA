@@ -1,0 +1,780 @@
+//+------------------------------------------------------------------+
+//|                                                EA-14-Stochastic.mq5 |
+//|                         Stochastic Crossover Expert Advisor       |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-14 - Stochastic Crossover"
+#property description "Active Stochastic %K/%D crossover strategy for MT5."
+
+#include <Trade/Trade.mqh>
+
+//--- General
+input ulong  MagicNumber             = 9014;  // Unique magic number
+input double LotSize                 = 0.10;  // Fixed lot size
+input int    MaxSpreadPoints         = 50;    // Maximum allowed spread in points
+
+//--- Stochastic
+input int    KPeriod                  = 14;    // Stochastic %K period
+input int    DPeriod                  = 3;     // Stochastic %D period
+input int    Slowing                  = 3;     // Stochastic slowing
+
+//--- Optional Level Filter
+input bool   UseLevelFilter           = false; // Enable overbought/oversold filter
+input double OversoldLevel            = 20.0;  // Oversold level
+input double OverboughtLevel          = 80.0;  // Overbought level
+
+//--- Optional Cross Strength
+input bool   UseCrossStrengthFilter   = false; // Enable minimum crossover distance
+input double MinimumCrossDistance     = 0.0;   // Minimum %K/%D distance
+
+//--- Risk Management
+input double StopLossPercent          = 0.50;  // Stop loss as percentage of entry
+input double RiskRewardRatio          = 1.50;  // Take profit risk/reward ratio
+
+//--- Optional Exit
+input bool   UseOppositeCrossExit     = false; // Close on opposite confirmed crossover
+
+//--- Trading Hours
+input bool   UseTradingHours           = false; // Enable trading hour restriction
+input int    StartHour                 = 0;     // Trading start hour
+input int    EndHour                   = 23;    // Trading end hour
+
+//--- Global objects
+CTrade   Trade;
+int      StochasticHandle = INVALID_HANDLE;
+datetime LastBarTime      = 0;
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize volume                                                  |
+//+------------------------------------------------------------------+
+double NormalizeVolume(const double requested_volume)
+{
+   double volume_min  = 0.0;
+   double volume_max  = 0.0;
+   double volume_step = 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN, volume_min))
+      return 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX, volume_max))
+      return 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP, volume_step))
+      return 0.0;
+
+   if(volume_min <= 0.0 || volume_max <= 0.0 || volume_step <= 0.0)
+      return 0.0;
+
+   double volume = requested_volume;
+
+   if(volume < volume_min)
+      volume = volume_min;
+
+   if(volume > volume_max)
+      volume = volume_max;
+
+   double steps = MathFloor((volume - volume_min) / volume_step + 1.0e-9);
+   volume = volume_min + steps * volume_step;
+
+   if(volume < volume_min)
+      volume = volume_min;
+
+   if(volume > volume_max)
+      volume = volume_max;
+
+   return NormalizeDouble(volume, 8);
+}
+
+//+------------------------------------------------------------------+
+//| Detect new bar                                                    |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime current_bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(current_bar_time <= 0)
+      return false;
+
+   if(LastBarTime == 0)
+   {
+      LastBarTime = current_bar_time;
+      return false;
+   }
+
+   if(current_bar_time != LastBarTime)
+   {
+      LastBarTime = current_bar_time;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get stochastic values from closed candles                        |
+//+------------------------------------------------------------------+
+bool GetStochasticValues(
+   double &k1,
+   double &k2,
+   double &d1,
+   double &d2
+)
+{
+   if(StochasticHandle == INVALID_HANDLE)
+      return false;
+
+   double k_buffer_1[1];
+   double k_buffer_2[1];
+   double d_buffer_1[1];
+   double d_buffer_2[1];
+
+   ArrayInitialize(k_buffer_1, 0.0);
+   ArrayInitialize(k_buffer_2, 0.0);
+   ArrayInitialize(d_buffer_1, 0.0);
+   ArrayInitialize(d_buffer_2, 0.0);
+
+   ResetLastError();
+
+   if(CopyBuffer(StochasticHandle, 0, 1, 1, k_buffer_1) != 1)
+      return false;
+
+   if(CopyBuffer(StochasticHandle, 0, 2, 1, k_buffer_2) != 1)
+      return false;
+
+   if(CopyBuffer(StochasticHandle, 1, 1, 1, d_buffer_1) != 1)
+      return false;
+
+   if(CopyBuffer(StochasticHandle, 1, 2, 1, d_buffer_2) != 1)
+      return false;
+
+   k1 = k_buffer_1[0];
+   k2 = k_buffer_2[0];
+   d1 = d_buffer_1[0];
+   d2 = d_buffer_2[0];
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish stochastic crossover                            |
+//+------------------------------------------------------------------+
+bool IsBullishCross(
+   const double k1,
+   const double k2,
+   const double d1,
+   const double d2
+)
+{
+   return (k2 <= d2 && k1 > d1);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish stochastic crossover                            |
+//+------------------------------------------------------------------+
+bool IsBearishCross(
+   const double k1,
+   const double k2,
+   const double d1,
+   const double d2
+)
+{
+   return (k2 >= d2 && k1 < d1);
+}
+
+//+------------------------------------------------------------------+
+//| Check optional stochastic level filter                            |
+//+------------------------------------------------------------------+
+bool PassesLevelFilter(
+   const bool bullish,
+   const double k1,
+   const double d1
+)
+{
+   if(!UseLevelFilter)
+      return true;
+
+   if(bullish)
+   {
+      return (k1 <= OversoldLevel && d1 <= OversoldLevel);
+   }
+
+   return (k1 >= OverboughtLevel && d1 >= OverboughtLevel);
+}
+
+//+------------------------------------------------------------------+
+//| Check optional crossover strength filter                          |
+//+------------------------------------------------------------------+
+bool PassesCrossStrengthFilter(
+   const bool bullish,
+   const double k1,
+   const double d1
+)
+{
+   if(!UseCrossStrengthFilter)
+      return true;
+
+   double distance = 0.0;
+
+   if(bullish)
+      distance = k1 - d1;
+   else
+      distance = d1 - k1;
+
+   return (distance >= MinimumCrossDistance);
+}
+
+//+------------------------------------------------------------------+
+//| Check whether an EA position already exists                       |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int total_positions = PositionsTotal();
+
+   for(int i = 0; i < total_positions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == (long)MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether spread is acceptable                                |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   if(MaxSpreadPoints < 0)
+      return false;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double spread_points = (tick.ask - tick.bid) / _Point;
+
+   return (spread_points <= (double)MaxSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| Check trading hours                                               |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime current_time;
+   TimeToStruct(TimeCurrent(), current_time);
+
+   int hour = current_time.hour;
+
+   if(StartHour == EndHour)
+      return true;
+
+   if(StartHour < EndHour)
+      return (hour >= StartHour && hour <= EndHour);
+
+   return (hour >= StartHour || hour <= EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate stop-loss price for BUY                                 |
+//+------------------------------------------------------------------+
+double CalculateStopLossBuy(const double entry_price)
+{
+   double sl = entry_price -
+               (entry_price * StopLossPercent / 100.0);
+
+   long stops_level_points = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimum_distance =
+      (double)stops_level_points * _Point;
+
+   if(minimum_distance > 0.0)
+   {
+      double maximum_sl = entry_price - minimum_distance;
+
+      if(sl > maximum_sl)
+         sl = maximum_sl;
+   }
+
+   return NormalizePrice(sl);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate stop-loss price for SELL                                |
+//+------------------------------------------------------------------+
+double CalculateStopLossSell(const double entry_price)
+{
+   double sl = entry_price +
+               (entry_price * StopLossPercent / 100.0);
+
+   long stops_level_points = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimum_distance =
+      (double)stops_level_points * _Point;
+
+   if(minimum_distance > 0.0)
+   {
+      double minimum_sl = entry_price + minimum_distance;
+
+      if(sl < minimum_sl)
+         sl = minimum_sl;
+   }
+
+   return NormalizePrice(sl);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate take-profit for BUY                                     |
+//+------------------------------------------------------------------+
+double CalculateTakeProfitBuy(
+   const double entry_price,
+   const double stop_loss
+)
+{
+   double risk = entry_price - stop_loss;
+
+   if(risk <= 0.0)
+      return 0.0;
+
+   double tp = entry_price + risk * RiskRewardRatio;
+
+   long stops_level_points = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimum_distance =
+      (double)stops_level_points * _Point;
+
+   if(minimum_distance > 0.0)
+   {
+      double minimum_tp = entry_price + minimum_distance;
+
+      if(tp < minimum_tp)
+         tp = minimum_tp;
+   }
+
+   return NormalizePrice(tp);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate take-profit for SELL                                    |
+//+------------------------------------------------------------------+
+double CalculateTakeProfitSell(
+   const double entry_price,
+   const double stop_loss
+)
+{
+   double risk = stop_loss - entry_price;
+
+   if(risk <= 0.0)
+      return 0.0;
+
+   double tp = entry_price - risk * RiskRewardRatio;
+
+   long stops_level_points = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimum_distance =
+      (double)stops_level_points * _Point;
+
+   if(minimum_distance > 0.0)
+   {
+      double minimum_tp = entry_price - minimum_distance;
+
+      if(tp > minimum_tp)
+         tp = minimum_tp;
+   }
+
+   return NormalizePrice(tp);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY position                                                 |
+//+------------------------------------------------------------------+
+bool OpenBuy()
+{
+   if(!IsSpreadAcceptable())
+      return false;
+
+   if(!IsTradingTime())
+      return false;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double volume = NormalizeVolume(LotSize);
+
+   if(volume <= 0.0)
+      return false;
+
+   double entry_price = NormalizePrice(tick.ask);
+
+   double stop_loss = CalculateStopLossBuy(entry_price);
+
+   if(stop_loss <= 0.0 || stop_loss >= entry_price)
+      return false;
+
+   double take_profit =
+      CalculateTakeProfitBuy(entry_price, stop_loss);
+
+   if(take_profit <= entry_price)
+      return false;
+
+   Trade.SetExpertMagicNumber(MagicNumber);
+   Trade.SetTypeFillingBySymbol(_Symbol);
+   Trade.SetDeviationInPoints(20);
+
+   ResetLastError();
+
+   bool result = Trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stop_loss,
+      take_profit,
+      "EA-14 Stochastic BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "EA-14 BUY failed. Retcode=",
+         Trade.ResultRetcode(),
+         " Description=",
+         Trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL position                                                |
+//+------------------------------------------------------------------+
+bool OpenSell()
+{
+   if(!IsSpreadAcceptable())
+      return false;
+
+   if(!IsTradingTime())
+      return false;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double volume = NormalizeVolume(LotSize);
+
+   if(volume <= 0.0)
+      return false;
+
+   double entry_price = NormalizePrice(tick.bid);
+
+   double stop_loss = CalculateStopLossSell(entry_price);
+
+   if(stop_loss <= entry_price)
+      return false;
+
+   double take_profit =
+      CalculateTakeProfitSell(entry_price, stop_loss);
+
+   if(take_profit <= 0.0 || take_profit >= entry_price)
+      return false;
+
+   Trade.SetExpertMagicNumber(MagicNumber);
+   Trade.SetTypeFillingBySymbol(_Symbol);
+   Trade.SetDeviationInPoints(20);
+
+   ResetLastError();
+
+   bool result = Trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stop_loss,
+      take_profit,
+      "EA-14 Stochastic SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "EA-14 SELL failed. Retcode=",
+         Trade.ResultRetcode(),
+         " Description=",
+         Trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing positions using opposite crossover               |
+//+------------------------------------------------------------------+
+void ManagePositions(
+   const bool bullish_cross,
+   const bool bearish_cross
+)
+{
+   if(!UseOppositeCrossExit)
+      return;
+
+   int total_positions = PositionsTotal();
+
+   for(int i = total_positions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != (long)MagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE position_type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      bool should_close = false;
+
+      if(position_type == POSITION_TYPE_BUY && bearish_cross)
+         should_close = true;
+
+      if(position_type == POSITION_TYPE_SELL && bullish_cross)
+         should_close = true;
+
+      if(!should_close)
+         continue;
+
+      Trade.SetExpertMagicNumber(MagicNumber);
+      Trade.SetTypeFillingBySymbol(_Symbol);
+      Trade.SetDeviationInPoints(20);
+
+      ResetLastError();
+
+      bool closed = Trade.PositionClose(ticket);
+
+      if(!closed)
+      {
+         Print(
+            "EA-14 position close failed. Ticket=",
+            ticket,
+            " Retcode=",
+            Trade.ResultRetcode(),
+            " Description=",
+            Trade.ResultRetcodeDescription()
+         );
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Validate input parameters                                         |
+//+------------------------------------------------------------------+
+bool ValidateParameters()
+{
+   if(KPeriod <= 0)
+      return false;
+
+   if(DPeriod <= 0)
+      return false;
+
+   if(Slowing <= 0)
+      return false;
+
+   if(LotSize <= 0.0)
+      return false;
+
+   if(MaxSpreadPoints < 0)
+      return false;
+
+   if(StopLossPercent <= 0.0)
+      return false;
+
+   if(RiskRewardRatio <= 0.0)
+      return false;
+
+   if(MinimumCrossDistance < 0.0)
+      return false;
+
+   if(OversoldLevel < 0.0 || OversoldLevel > 100.0)
+      return false;
+
+   if(OverboughtLevel < 0.0 || OverboughtLevel > 100.0)
+      return false;
+
+   if(OversoldLevel >= OverboughtLevel)
+      return false;
+
+   if(StartHour < 0 || StartHour > 23)
+      return false;
+
+   if(EndHour < 0 || EndHour > 23)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(!ValidateParameters())
+   {
+      Print("EA-14: Invalid input parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   StochasticHandle = iStochastic(
+      _Symbol,
+      PERIOD_CURRENT,
+      KPeriod,
+      DPeriod,
+      Slowing,
+      MODE_SMA,
+      STO_LOWHIGH
+   );
+
+   if(StochasticHandle == INVALID_HANDLE)
+   {
+      Print(
+         "EA-14: Failed to create Stochastic handle. Error=",
+         GetLastError()
+      );
+
+      return INIT_FAILED;
+   }
+
+   Trade.SetExpertMagicNumber(MagicNumber);
+   Trade.SetTypeFillingBySymbol(_Symbol);
+   Trade.SetDeviationInPoints(20);
+
+   LastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   Print(
+      "EA-14 Stochastic Crossover initialized. ",
+      "Magic=", MagicNumber,
+      ", K=", KPeriod,
+      ", D=", DPeriod,
+      ", Slowing=", Slowing
+   );
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(StochasticHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(StochasticHandle);
+      StochasticHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   double k1 = 0.0;
+   double k2 = 0.0;
+   double d1 = 0.0;
+   double d2 = 0.0;
+
+   if(!GetStochasticValues(k1, k2, d1, d2))
+      return;
+
+   bool bullish_cross = IsBullishCross(k1, k2, d1, d2);
+   bool bearish_cross = IsBearishCross(k1, k2, d1, d2);
+
+   if(!bullish_cross && !bearish_cross)
+      return;
+
+   ManagePositions(bullish_cross, bearish_cross);
+
+   if(HasOpenPosition())
+      return;
+
+   if(!IsTradingTime())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   if(bullish_cross)
+   {
+      if(!PassesLevelFilter(true, k1, d1))
+         return;
+
+      if(!PassesCrossStrengthFilter(true, k1, d1))
+         return;
+
+      OpenBuy();
+      return;
+   }
+
+   if(bearish_cross)
+   {
+      if(!PassesLevelFilter(false, k1, d1))
+         return;
+
+      if(!PassesCrossStrengthFilter(false, k1, d1))
+         return;
+
+      OpenSell();
+   }
+}
+//+------------------------------------------------------------------+

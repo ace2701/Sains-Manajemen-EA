@@ -1,0 +1,618 @@
+//+------------------------------------------------------------------+
+//|                                             TripleEMA_Trend.mq5  |
+//|                        Triple EMA Trend Expert Advisor            |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "Triple EMA Trend EA with ATR Stop Loss and Risk:Reward Take Profit"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- Optimization / Strategy Inputs
+input int      FastEMA_Period      = 9;
+input int      MediumEMA_Period    = 21;
+input int      SlowEMA_Period      = 50;
+
+input int      ATR_Period          = 14;
+input double   ATR_SL_Multiplier   = 2.0;
+input double   RiskRewardRatio     = 2.0;
+
+input double   FixedLotSize        = 0.10;
+input int      MaximumSpread       = 30;
+input ulong    MagicNumber         = 305013;
+
+//--- Indicator handles
+int fastEMAHandle   = INVALID_HANDLE;
+int mediumEMAHandle = INVALID_HANDLE;
+int slowEMAHandle   = INVALID_HANDLE;
+int atrHandle       = INVALID_HANDLE;
+
+//--- New candle tracking
+datetime lastBarTime = 0;
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate EMA settings
+   if(FastEMA_Period <= 0 ||
+      MediumEMA_Period <= 0 ||
+      SlowEMA_Period <= 0)
+   {
+      Print("Error: EMA periods must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Validate EMA order
+   if(FastEMA_Period >= MediumEMA_Period ||
+      MediumEMA_Period >= SlowEMA_Period)
+   {
+      Print("Error: Fast EMA must be smaller than Medium EMA, ");
+      Print("and Medium EMA must be smaller than Slow EMA.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Validate ATR settings
+   if(ATR_Period <= 0 || ATR_SL_Multiplier <= 0.0)
+   {
+      Print("Error: Invalid ATR parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Validate Risk:Reward
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("Error: RiskRewardRatio must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Validate lot size
+   if(FixedLotSize <= 0.0)
+   {
+      Print("Error: FixedLotSize must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create EMA handles
+   fastEMAHandle = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      FastEMA_Period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   mediumEMAHandle = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      MediumEMA_Period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   slowEMAHandle = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      SlowEMA_Period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATR_Period
+   );
+
+   //--- Check indicator handles
+   if(fastEMAHandle == INVALID_HANDLE ||
+      mediumEMAHandle == INVALID_HANDLE ||
+      slowEMAHandle == INVALID_HANDLE ||
+      atrHandle == INVALID_HANDLE)
+   {
+      Print("Error: Failed to create indicator handles.");
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetDeviationInPoints(10);
+
+   //--- Initialize last bar time
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   Print("Triple EMA Trend EA initialized successfully.");
+
+   return INIT_SUCCEEDED;
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   //--- Release indicator handles
+   if(fastEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(fastEMAHandle);
+
+   if(mediumEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(mediumEMAHandle);
+
+   if(slowEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(slowEMAHandle);
+
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Process signals only once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Only manage this EA's own position
+   if(HasOwnOpenPosition())
+      return;
+
+   //--- Check spread
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Need enough historical bars
+   int requiredBars = SlowEMA_Period + 10;
+
+   if(Bars(_Symbol, PERIOD_CURRENT) < requiredBars)
+      return;
+
+   //--- Indicator data arrays
+   double fastEMA[2];
+   double mediumEMA[2];
+   double slowEMA[2];
+   double atrValue[1];
+
+   ArraySetAsSeries(fastEMA, true);
+   ArraySetAsSeries(mediumEMA, true);
+   ArraySetAsSeries(slowEMA, true);
+   ArraySetAsSeries(atrValue, true);
+
+   //--- Copy only CLOSED candle data
+   //--- Position 0 in these arrays corresponds to bar 1
+   if(CopyBuffer(
+      fastEMAHandle,
+      0,
+      1,
+      2,
+      fastEMA
+   ) != 2)
+   {
+      Print("Error: Failed to copy Fast EMA data.");
+      return;
+   }
+
+   if(CopyBuffer(
+      mediumEMAHandle,
+      0,
+      1,
+      2,
+      mediumEMA
+   ) != 2)
+   {
+      Print("Error: Failed to copy Medium EMA data.");
+      return;
+   }
+
+   if(CopyBuffer(
+      slowEMAHandle,
+      0,
+      1,
+      2,
+      slowEMA
+   ) != 2)
+   {
+      Print("Error: Failed to copy Slow EMA data.");
+      return;
+   }
+
+   if(CopyBuffer(
+      atrHandle,
+      0,
+      1,
+      1,
+      atrValue
+   ) != 1)
+   {
+      Print("Error: Failed to copy ATR data.");
+      return;
+   }
+
+   //--- Get closed candle OHLC
+   double openPrice  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   if(openPrice <= 0.0 || closePrice <= 0.0)
+      return;
+
+   //--- ATR must be valid
+   if(atrValue[0] <= 0.0)
+      return;
+
+   //--- BUY condition
+   bool buySignal =
+      fastEMA[0] > mediumEMA[0] &&
+      mediumEMA[0] > slowEMA[0] &&
+      closePrice > openPrice;
+
+   //--- SELL condition
+   bool sellSignal =
+      fastEMA[0] < mediumEMA[0] &&
+      mediumEMA[0] < slowEMA[0] &&
+      closePrice < openPrice;
+
+   //--- Execute BUY
+   if(buySignal)
+   {
+      OpenBuy(atrValue[0]);
+      return;
+   }
+
+   //--- Execute SELL
+   if(sellSignal)
+   {
+      OpenSell(atrValue[0]);
+      return;
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Check for new candle                                             |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+
+//+------------------------------------------------------------------+
+//| Check maximum spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Error: Failed to obtain current tick.");
+      return false;
+   }
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaximumSpread);
+}
+
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position                       |
+//+------------------------------------------------------------------+
+bool HasOwnOpenPosition()
+{
+   int totalPositions = PositionsTotal();
+
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+
+//+------------------------------------------------------------------+
+//| Normalize volume according to symbol specifications              |
+//+------------------------------------------------------------------+
+double NormalizeVolume(double volume)
+{
+   double minVolume  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVolume  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(volumeStep <= 0.0)
+      return 0.0;
+
+   volume = MathMax(volume, minVolume);
+   volume = MathMin(volume, maxVolume);
+
+   volume = MathFloor(volume / volumeStep) * volumeStep;
+
+   int volumeDigits = 0;
+
+   if(volumeStep < 1.0)
+   {
+      double step = volumeStep;
+
+      while(step < 1.0 && volumeDigits < 8)
+      {
+         step *= 10.0;
+         volumeDigits++;
+      }
+   }
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   return NormalizeDouble(price, _Digits);
+}
+
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy(double atr)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("BUY Error: Failed to obtain tick data.");
+      return;
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("BUY Error: Invalid normalized volume.");
+      return;
+   }
+
+   //--- ATR-based stop loss
+   double stopDistance = atr * ATR_SL_Multiplier;
+
+   if(stopDistance <= 0.0)
+      return;
+
+   double entryPrice = tick.ask;
+
+   double stopLoss =
+      entryPrice - stopDistance;
+
+   //--- TP based on Risk:Reward
+   double takeProfit =
+      entryPrice + (stopDistance * RiskRewardRatio);
+
+   //--- Respect minimum stop distance
+   if(!AdjustStopsForBuy(entryPrice, stopLoss, takeProfit))
+      return;
+
+   stopLoss   = NormalizePrice(stopLoss);
+   takeProfit = NormalizePrice(takeProfit);
+
+   if(!trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "Triple EMA BUY"
+   ))
+   {
+      Print(
+         "BUY failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription()
+      );
+
+      return;
+   }
+
+   Print(
+      "BUY opened. Ticket: ",
+      trade.ResultOrder(),
+      " Volume: ",
+      DoubleToString(volume, 2),
+      " SL: ",
+      DoubleToString(stopLoss, _Digits),
+      " TP: ",
+      DoubleToString(takeProfit, _Digits)
+   );
+}
+
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell(double atr)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("SELL Error: Failed to obtain tick data.");
+      return;
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("SELL Error: Invalid normalized volume.");
+      return;
+   }
+
+   //--- ATR-based stop loss
+   double stopDistance = atr * ATR_SL_Multiplier;
+
+   if(stopDistance <= 0.0)
+      return;
+
+   double entryPrice = tick.bid;
+
+   double stopLoss =
+      entryPrice + stopDistance;
+
+   //--- TP based on Risk:Reward
+   double takeProfit =
+      entryPrice - (stopDistance * RiskRewardRatio);
+
+   //--- Respect minimum stop distance
+   if(!AdjustStopsForSell(entryPrice, stopLoss, takeProfit))
+      return;
+
+   stopLoss   = NormalizePrice(stopLoss);
+   takeProfit = NormalizePrice(takeProfit);
+
+   if(!trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "Triple EMA SELL"
+   ))
+   {
+      Print(
+         "SELL failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription()
+      );
+
+      return;
+   }
+
+   Print(
+      "SELL opened. Ticket: ",
+      trade.ResultOrder(),
+      " Volume: ",
+      DoubleToString(volume, 2),
+      " SL: ",
+      DoubleToString(stopLoss, _Digits),
+      " TP: ",
+      DoubleToString(takeProfit, _Digits)
+   );
+}
+
+
+//+------------------------------------------------------------------+
+//| Adjust BUY stops according to broker minimum distance             |
+//+------------------------------------------------------------------+
+bool AdjustStopsForBuy(
+   double entryPrice,
+   double &stopLoss,
+   double &takeProfit
+)
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      (double)stopsLevel * _Point;
+
+   if(minimumDistance > 0.0)
+   {
+      if((entryPrice - stopLoss) < minimumDistance)
+         stopLoss = entryPrice - minimumDistance;
+
+      if((takeProfit - entryPrice) < minimumDistance)
+         takeProfit = entryPrice + minimumDistance;
+   }
+
+   if(stopLoss <= 0.0 || takeProfit <= 0.0)
+      return false;
+
+   if(stopLoss >= entryPrice)
+      return false;
+
+   if(takeProfit <= entryPrice)
+      return false;
+
+   return true;
+}
+
+
+//+------------------------------------------------------------------+
+//| Adjust SELL stops according to broker minimum distance            |
+//+------------------------------------------------------------------+
+bool AdjustStopsForSell(
+   double entryPrice,
+   double &stopLoss,
+   double &takeProfit
+)
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      (double)stopsLevel * _Point;
+
+   if(minimumDistance > 0.0)
+   {
+      if((stopLoss - entryPrice) < minimumDistance)
+         stopLoss = entryPrice + minimumDistance;
+
+      if((entryPrice - takeProfit) < minimumDistance)
+         takeProfit = entryPrice - minimumDistance;
+   }
+
+   if(stopLoss <= 0.0 || takeProfit <= 0.0)
+      return false;
+
+   if(stopLoss <= entryPrice)
+      return false;
+
+   if(takeProfit >= entryPrice)
+      return false;
+
+   return true;
+}
+//+------------------------------------------------------------------+

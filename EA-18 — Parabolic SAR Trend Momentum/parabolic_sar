@@ -1,0 +1,919 @@
+//+------------------------------------------------------------------+
+//| EA-18 — Parabolic SAR Trend Momentum                            |
+//| Native MQL5 Expert Advisor                                      |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "Parabolic SAR Trend Momentum EA"
+#property description "SAR + EMA trend filter + candle momentum + ATR risk"
+
+//--- Trading library
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| GENERAL                                                          |
+//+------------------------------------------------------------------+
+input group "GENERAL"
+input long   MagicNumber                  = 18018;
+input double FixedLotSize                 = 0.10;
+input int    MaximumAllowedSpreadPoints   = 50;
+
+//+------------------------------------------------------------------+
+//| PARABOLIC SAR                                                    |
+//+------------------------------------------------------------------+
+input group "PARABOLIC SAR"
+input double SARStep                      = 0.02;
+input double SARMaximum                   = 0.20;
+
+//+------------------------------------------------------------------+
+//| EMA FILTER                                                       |
+//+------------------------------------------------------------------+
+input group "EMA FILTER"
+input bool   EnableEMAFilter              = true;
+input int    EMAPeriod                    = 50;
+
+//+------------------------------------------------------------------+
+//| MOMENTUM                                                         |
+//+------------------------------------------------------------------+
+input group "MOMENTUM"
+input double MinimumBodyPercent           = 20.0;
+
+//+------------------------------------------------------------------+
+//| ATR RISK                                                         |
+//+------------------------------------------------------------------+
+input group "ATR RISK"
+input int    ATRPeriod                    = 14;
+input double ATRStopMultiplier            = 1.5;
+input int    MinimumStopLossPoints        = 100;
+input int    MaximumStopLossPoints        = 600;
+
+//+------------------------------------------------------------------+
+//| TAKE PROFIT                                                       |
+//+------------------------------------------------------------------+
+input group "TAKE PROFIT"
+input double RiskRewardRatio              = 1.5;
+
+//+------------------------------------------------------------------+
+//| EXIT                                                             |
+//+------------------------------------------------------------------+
+input group "EXIT"
+input bool   EnableSARExit                = false;
+
+//+------------------------------------------------------------------+
+//| TRADING HOURS                                                    |
+//+------------------------------------------------------------------+
+input group "TRADING HOURS"
+input bool   EnableTradingHours           = false;
+input int    TradingStartHour             = 0;
+input int    TradingEndHour               = 23;
+
+//--- Indicator handles
+int sarHandle = INVALID_HANDLE;
+int emaHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
+
+//--- New-bar tracking
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate inputs
+   if(MagicNumber <= 0)
+   {
+      Print("ERROR: MagicNumber must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(FixedLotSize <= 0.0)
+   {
+      Print("ERROR: FixedLotSize must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(SARStep <= 0.0 || SARMaximum <= 0.0 || SARStep >= SARMaximum)
+   {
+      Print("ERROR: Invalid Parabolic SAR parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(EMAPeriod <= 0)
+   {
+      Print("ERROR: EMAPeriod must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATRPeriod <= 0 || ATRStopMultiplier <= 0.0)
+   {
+      Print("ERROR: Invalid ATR parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MinimumStopLossPoints <= 0 ||
+      MaximumStopLossPoints < MinimumStopLossPoints)
+   {
+      Print("ERROR: Invalid stop-loss boundaries.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("ERROR: RiskRewardRatio must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MinimumBodyPercent < 0.0 || MinimumBodyPercent > 100.0)
+   {
+      Print("ERROR: MinimumBodyPercent must be between 0 and 100.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MaximumAllowedSpreadPoints < 0)
+   {
+      Print("ERROR: MaximumAllowedSpreadPoints cannot be negative.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(TradingStartHour < 0 || TradingStartHour > 23 ||
+      TradingEndHour < 0 || TradingEndHour > 23)
+   {
+      Print("ERROR: Trading hours must be between 0 and 23.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create Parabolic SAR handle
+   sarHandle = iSAR(_Symbol, PERIOD_H1, SARStep, SARMaximum);
+
+   if(sarHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create Parabolic SAR handle.");
+      return INIT_FAILED;
+   }
+
+   //--- Create EMA handle
+   emaHandle = iMA(
+      _Symbol,
+      PERIOD_H1,
+      EMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   if(emaHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create EMA handle.");
+      return INIT_FAILED;
+   }
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_H1,
+      ATRPeriod
+   );
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR handle.");
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   //--- Initialize current bar time
+   lastBarTime = iTime(_Symbol, PERIOD_H1, 0);
+
+   Print("EA-18 — Parabolic SAR Trend Momentum initialized successfully.");
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(sarHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(sarHandle);
+      sarHandle = INVALID_HANDLE;
+   }
+
+   if(emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(emaHandle);
+      emaHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Optional SAR exit is evaluated on a new closed candle
+   if(IsNewBar())
+   {
+      if(EnableSARExit)
+         ManageSARExit();
+
+      EvaluateEntry();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect new H1 bar                                                |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether trading is allowed                                 |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+{
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return false;
+
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return false;
+
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Trading-hours filter                                             |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+{
+   if(!EnableTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   //--- Same hour range, e.g. 09 -> 17
+   if(TradingStartHour < TradingEndHour)
+   {
+      if(hour >= TradingStartHour && hour <= TradingEndHour)
+         return true;
+
+      return false;
+   }
+
+   //--- Same start/end hour means that hour is allowed
+   if(TradingStartHour == TradingEndHour)
+      return (hour == TradingStartHour);
+
+   //--- Overnight range, e.g. 22 -> 05
+   if(hour >= TradingStartHour || hour <= TradingEndHour)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check current spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   if(tick.ask <= 0.0 || tick.bid <= 0.0)
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   if(spreadPoints > (double)MaximumAllowedSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA already has a position on symbol           |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int totalPositions = PositionsTotal();
+
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Read indicator value                                             |
+//+------------------------------------------------------------------+
+bool GetIndicatorValue(
+   const int handle,
+   const int shift,
+   double &value
+)
+{
+   double buffer[1];
+
+   ArraySetAsSeries(buffer, true);
+
+   int copied = CopyBuffer(
+      handle,
+      0,
+      shift,
+      1,
+      buffer
+   );
+
+   if(copied != 1)
+      return false;
+
+   value = buffer[0];
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(const double requestedLot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(minLot <= 0.0 || maxLot <= 0.0 || lotStep <= 0.0)
+      return 0.0;
+
+   double lot = requestedLot;
+
+   if(lot < minLot)
+      lot = minLot;
+
+   if(lot > maxLot)
+      lot = maxLot;
+
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   if(lot < minLot)
+      lot = minLot;
+
+   int volumeDigits = 0;
+
+   double stepCheck = lotStep;
+
+   while(stepCheck < 1.0 && volumeDigits < 8)
+   {
+      stepCheck *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(lot, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate adaptive stop distance in points                       |
+//+------------------------------------------------------------------+
+double CalculateStopDistancePoints(const double atrValue)
+{
+   double atrDistancePoints =
+      (atrValue * ATRStopMultiplier) / _Point;
+
+   double stopDistancePoints = atrDistancePoints;
+
+   //--- Apply requested minimum
+   if(stopDistancePoints < (double)MinimumStopLossPoints)
+      stopDistancePoints = (double)MinimumStopLossPoints;
+
+   //--- Apply requested maximum
+   if(stopDistancePoints > (double)MaximumStopLossPoints)
+      stopDistancePoints = (double)MaximumStopLossPoints;
+
+   //--- Respect broker minimum stop distance
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double brokerMinimumPoints = (double)stopsLevel;
+
+   if(stopDistancePoints < brokerMinimumPoints)
+      stopDistancePoints = brokerMinimumPoints;
+
+   return stopDistancePoints;
+}
+
+//+------------------------------------------------------------------+
+//| Check and adjust stop levels                                     |
+//+------------------------------------------------------------------+
+bool PrepareStopLevels(
+   const ENUM_ORDER_TYPE orderType,
+   const double entryPrice,
+   double &stopLoss,
+   double &takeProfit
+)
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      (double)stopsLevel * _Point;
+
+   double stopDistance = MathAbs(entryPrice - stopLoss);
+
+   if(stopDistance < minimumDistance)
+   {
+      if(orderType == ORDER_TYPE_BUY)
+         stopLoss = entryPrice - minimumDistance;
+      else
+         stopLoss = entryPrice + minimumDistance;
+   }
+
+   stopDistance = MathAbs(entryPrice - stopLoss);
+
+   double takeProfitDistance =
+      stopDistance * RiskRewardRatio;
+
+   if(orderType == ORDER_TYPE_BUY)
+      takeProfit = entryPrice + takeProfitDistance;
+   else
+      takeProfit = entryPrice - takeProfitDistance;
+
+   //--- Normalize all prices
+   stopLoss   = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Final broker-distance validation
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      if(stopLoss >= entryPrice)
+         return false;
+
+      if(takeProfit <= entryPrice)
+         return false;
+
+      if((entryPrice - stopLoss) < minimumDistance)
+         return false;
+
+      if((takeProfit - entryPrice) < minimumDistance)
+         return false;
+   }
+   else
+   {
+      if(stopLoss <= entryPrice)
+         return false;
+
+      if(takeProfit >= entryPrice)
+         return false;
+
+      if((stopLoss - entryPrice) < minimumDistance)
+         return false;
+
+      if((entryPrice - takeProfit) < minimumDistance)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate entry signals                                           |
+//+------------------------------------------------------------------+
+void EvaluateEntry()
+{
+   if(!IsTradingAllowed())
+      return;
+
+   if(!IsWithinTradingHours())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Only one EA position on this symbol
+   if(HasOpenPosition())
+      return;
+
+   //--- Make sure enough bars exist
+   int requiredBars = MathMax(
+      MathMax(EMAPeriod, ATRPeriod) + 10,
+      100
+   );
+
+   if(Bars(_Symbol, PERIOD_H1) < requiredBars)
+      return;
+
+   //--- Closed candle prices
+   double close1 = iClose(_Symbol, PERIOD_H1, 1);
+   double open1  = iOpen(_Symbol, PERIOD_H1, 1);
+   double high1  = iHigh(_Symbol, PERIOD_H1, 1);
+   double low1   = iLow(_Symbol, PERIOD_H1, 1);
+
+   double close2 = iClose(_Symbol, PERIOD_H1, 2);
+
+   if(close1 <= 0.0 || open1 <= 0.0 ||
+      high1 <= 0.0 || low1 <= 0.0 ||
+      close2 <= 0.0)
+   {
+      return;
+   }
+
+   //--- Indicator values from CLOSED candles
+   double sar1 = 0.0;
+   double sar2 = 0.0;
+   double ema1 = 0.0;
+   double atr1 = 0.0;
+
+   if(!GetIndicatorValue(sarHandle, 1, sar1))
+      return;
+
+   if(!GetIndicatorValue(sarHandle, 2, sar2))
+      return;
+
+   if(EnableEMAFilter)
+   {
+      if(!GetIndicatorValue(emaHandle, 1, ema1))
+         return;
+   }
+
+   if(!GetIndicatorValue(atrHandle, 1, atr1))
+      return;
+
+   if(atr1 <= 0.0)
+      return;
+
+   //--- Candle momentum
+   double candleRange = high1 - low1;
+
+   if(candleRange <= 0.0)
+      return;
+
+   double candleBody = MathAbs(close1 - open1);
+
+   double bodyPercent =
+      (candleBody / candleRange) * 100.0;
+
+   if(bodyPercent < MinimumBodyPercent)
+      return;
+
+   //--- BUY CONDITIONS
+   bool bullishCandle = (close1 > open1);
+
+   bool bullishSAR =
+      (sar1 < close1);
+
+   bool previousBullishSAR =
+      (sar2 < close2);
+
+   bool bullishEMA =
+      (!EnableEMAFilter || close1 > ema1);
+
+   //--- SELL CONDITIONS
+   bool bearishCandle = (close1 < open1);
+
+   bool bearishSAR =
+      (sar1 > close1);
+
+   bool previousBearishSAR =
+      (sar2 > close2);
+
+   bool bearishEMA =
+      (!EnableEMAFilter || close1 < ema1);
+
+   //--- Determine signal
+   bool buySignal =
+      bullishCandle &&
+      bullishSAR &&
+      previousBullishSAR &&
+      bullishEMA;
+
+   bool sellSignal =
+      bearishCandle &&
+      bearishSAR &&
+      previousBearishSAR &&
+      bearishEMA;
+
+   //--- Prevent ambiguous signals
+   if(buySignal == sellSignal)
+      return;
+
+   //--- Current market prices
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   //--- BUY
+   if(buySignal)
+   {
+      OpenBuy(tick.ask, atr1);
+      return;
+   }
+
+   //--- SELL
+   if(sellSignal)
+   {
+      OpenSell(tick.bid, atr1);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy(
+   const double entryPrice,
+   const double atrValue
+)
+{
+   if(entryPrice <= 0.0)
+      return;
+
+   double lot = NormalizeLotSize(FixedLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("BUY rejected: invalid normalized lot size.");
+      return;
+   }
+
+   double stopDistancePoints =
+      CalculateStopDistancePoints(atrValue);
+
+   if(stopDistancePoints <= 0.0)
+      return;
+
+   double stopLoss =
+      entryPrice - (stopDistancePoints * _Point);
+
+   double takeProfit =
+      entryPrice +
+      (stopDistancePoints * RiskRewardRatio * _Point);
+
+   if(!PrepareStopLevels(
+         ORDER_TYPE_BUY,
+         entryPrice,
+         stopLoss,
+         takeProfit))
+   {
+      Print("BUY rejected: invalid stop levels.");
+      return;
+   }
+
+   bool result = trade.Buy(
+      lot,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-18 SAR Momentum BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+      return;
+   }
+
+   Print(
+      "BUY opened. Lot=",
+      DoubleToString(lot, 2),
+      " SL=",
+      DoubleToString(stopLoss, _Digits),
+      " TP=",
+      DoubleToString(takeProfit, _Digits),
+      " Retcode=",
+      trade.ResultRetcode()
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell(
+   const double entryPrice,
+   const double atrValue
+)
+{
+   if(entryPrice <= 0.0)
+      return;
+
+   double lot = NormalizeLotSize(FixedLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("SELL rejected: invalid normalized lot size.");
+      return;
+   }
+
+   double stopDistancePoints =
+      CalculateStopDistancePoints(atrValue);
+
+   if(stopDistancePoints <= 0.0)
+      return;
+
+   double stopLoss =
+      entryPrice + (stopDistancePoints * _Point);
+
+   double takeProfit =
+      entryPrice -
+      (stopDistancePoints * RiskRewardRatio * _Point);
+
+   if(!PrepareStopLevels(
+         ORDER_TYPE_SELL,
+         entryPrice,
+         stopLoss,
+         takeProfit))
+   {
+      Print("SELL rejected: invalid stop levels.");
+      return;
+   }
+
+   bool result = trade.Sell(
+      lot,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-18 SAR Momentum SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+      return;
+   }
+
+   Print(
+      "SELL opened. Lot=",
+      DoubleToString(lot, 2),
+      " SL=",
+      DoubleToString(stopLoss, _Digits),
+      " TP=",
+      DoubleToString(takeProfit, _Digits),
+      " Retcode=",
+      trade.ResultRetcode()
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Optional Parabolic SAR exit                                      |
+//+------------------------------------------------------------------+
+void ManageSARExit()
+{
+   double sar1 = 0.0;
+   double sar2 = 0.0;
+
+   double close1 = iClose(_Symbol, PERIOD_H1, 1);
+   double close2 = iClose(_Symbol, PERIOD_H1, 2);
+
+   if(close1 <= 0.0 || close2 <= 0.0)
+      return;
+
+   if(!GetIndicatorValue(sarHandle, 1, sar1))
+      return;
+
+   if(!GetIndicatorValue(sarHandle, 2, sar2))
+      return;
+
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol =
+         PositionGetString(POSITION_SYMBOL);
+
+      long magic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(
+            POSITION_TYPE
+         );
+
+      bool closePosition = false;
+
+      //--- BUY closes on confirmed bearish SAR reversal
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         bool bearishNow =
+            (sar1 > close1);
+
+         bool bearishPrevious =
+            (sar2 > close2);
+
+         if(bearishNow && bearishPrevious)
+            closePosition = true;
+      }
+
+      //--- SELL closes on confirmed bullish SAR reversal
+      if(positionType == POSITION_TYPE_SELL)
+      {
+         bool bullishNow =
+            (sar1 < close1);
+
+         bool bullishPrevious =
+            (sar2 < close2);
+
+         if(bullishNow && bullishPrevious)
+            closePosition = true;
+      }
+
+      if(closePosition)
+      {
+         bool result = trade.PositionClose(ticket);
+
+         if(!result)
+         {
+            Print(
+               "SAR exit failed for ticket ",
+               ticket,
+               ". Retcode=",
+               trade.ResultRetcode(),
+               " Description=",
+               trade.ResultRetcodeDescription()
+            );
+         }
+         else
+         {
+            Print(
+               "SAR exit executed for ticket ",
+               ticket,
+               ". Retcode=",
+               trade.ResultRetcode()
+            );
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+

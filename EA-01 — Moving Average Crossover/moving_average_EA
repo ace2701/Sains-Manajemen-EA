@@ -1,0 +1,743 @@
+//+------------------------------------------------------------------+
+//|                                      EMA_Crossover_ATR_EA.mq5    |
+//|                        Native MQL5 - MetaTrader 5                |
+//|                        EMA Crossover + ATR Risk Management       |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EMA Crossover EA using closed candles only"
+#property description "ATR-based Stop Loss and configurable Risk/Reward"
+#property description "Designed for MT5 Strategy Tester optimization"
+
+#include <Trade/Trade.mqh>
+
+//==================================================================
+// INPUT PARAMETERS
+//==================================================================
+
+//--- Moving Average settings
+input int      InpFastEMAPeriod       = 20;       // Fast EMA Period
+input int      InpSlowEMAPeriod       = 50;       // Slow EMA Period
+
+//--- ATR Risk Management
+input int      InpATRPeriod           = 14;       // ATR Period
+input double   InpATRMultiplier       = 2.0;      // ATR Stop Loss Multiplier
+input double   InpRiskReward          = 2.0;      // Risk : Reward Ratio
+
+//--- Trading settings
+input double   InpLotSize             = 0.10;     // Lot Size
+input double   InpMaxSpread           = 30.0;     // Maximum Spread (points)
+input ulong    InpMagicNumber         = 20260913; // Magic Number
+
+//==================================================================
+// GLOBAL VARIABLES
+//==================================================================
+
+CTrade trade;
+
+int g_fastEMAHandle = INVALID_HANDLE;
+int g_slowEMAHandle = INVALID_HANDLE;
+int g_atrHandle     = INVALID_HANDLE;
+
+datetime g_lastBarTime = 0;
+
+//==================================================================
+// FUNCTION: Normalize volume
+//==================================================================
+
+double NormalizeLotSize(const double volume)
+{
+   double minVolume  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVolume  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(volumeStep <= 0.0)
+      return volume;
+
+   double normalizedVolume = volume;
+
+   //--- Respect broker limits
+   if(normalizedVolume < minVolume)
+      normalizedVolume = minVolume;
+
+   if(normalizedVolume > maxVolume)
+      normalizedVolume = maxVolume;
+
+   //--- Align with volume step
+   normalizedVolume = MathFloor(normalizedVolume / volumeStep) * volumeStep;
+
+   //--- Check again after rounding
+   if(normalizedVolume < minVolume)
+      normalizedVolume = minVolume;
+
+   //--- Determine suitable decimal precision
+   int volumeDigits = 0;
+   double stepCheck = volumeStep;
+
+   while(volumeDigits < 8 && MathAbs(stepCheck - MathRound(stepCheck)) > 0.00000001)
+   {
+      stepCheck *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(normalizedVolume, volumeDigits);
+}
+
+//==================================================================
+// FUNCTION: Check whether a new candle has formed
+//==================================================================
+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != g_lastBarTime)
+   {
+      g_lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//==================================================================
+// FUNCTION: Check spread
+//==================================================================
+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("ERROR: Unable to retrieve current tick.");
+      return false;
+   }
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   if(spreadPoints > InpMaxSpread)
+   {
+      PrintFormat(
+         "Spread too high: %.1f points. Maximum allowed: %.1f points.",
+         spreadPoints,
+         InpMaxSpread
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//==================================================================
+// FUNCTION: Check if there is any open position on this symbol
+//
+// We intentionally block trading if ANY position exists on this
+// symbol. This prevents the EA from interfering with positions
+// belonging to another EA or manual trade, especially on netting
+// accounts.
+//==================================================================
+
+bool HasPositionOnSymbol()
+{
+   int totalPositions = PositionsTotal();
+
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      string positionSymbol = PositionGetString(POSITION_SYMBOL);
+
+      if(positionSymbol == _Symbol)
+         return true;
+   }
+
+   return false;
+}
+
+//==================================================================
+// FUNCTION: Get EMA values
+//
+// index 0 = bar 1 (last CLOSED candle)
+// index 1 = bar 2 (previous CLOSED candle)
+//==================================================================
+
+bool GetEMAValues(
+   double &fastBar1,
+   double &fastBar2,
+   double &slowBar1,
+   double &slowBar2
+)
+{
+   double fastBuffer[2];
+   double slowBuffer[2];
+
+   ArraySetAsSeries(fastBuffer, true);
+   ArraySetAsSeries(slowBuffer, true);
+
+   //--- Start from bar 1, never bar 0
+   int copiedFast = CopyBuffer(
+      g_fastEMAHandle,
+      0,
+      1,
+      2,
+      fastBuffer
+   );
+
+   int copiedSlow = CopyBuffer(
+      g_slowEMAHandle,
+      0,
+      1,
+      2,
+      slowBuffer
+   );
+
+   if(copiedFast != 2 || copiedSlow != 2)
+   {
+      PrintFormat(
+         "ERROR: Unable to copy EMA data. Fast=%d Slow=%d",
+         copiedFast,
+         copiedSlow
+      );
+
+      return false;
+   }
+
+   //--- Because data starts at bar 1:
+   //--- [0] = bar 1
+   //--- [1] = bar 2
+   fastBar1 = fastBuffer[0];
+   fastBar2 = fastBuffer[1];
+
+   slowBar1 = slowBuffer[0];
+   slowBar2 = slowBuffer[1];
+
+   return true;
+}
+
+//==================================================================
+// FUNCTION: Get ATR from last CLOSED candle
+//==================================================================
+
+bool GetATR(double &atrValue)
+{
+   double atrBuffer[1];
+
+   ArraySetAsSeries(atrBuffer, true);
+
+   //--- ATR from bar 1 only
+   int copied = CopyBuffer(
+      g_atrHandle,
+      0,
+      1,
+      1,
+      atrBuffer
+   );
+
+   if(copied != 1)
+   {
+      PrintFormat("ERROR: Unable to copy ATR data. Copied=%d", copied);
+      return false;
+   }
+
+   atrValue = atrBuffer[0];
+
+   if(atrValue <= 0.0)
+   {
+      Print("ERROR: Invalid ATR value.");
+      return false;
+   }
+
+   return true;
+}
+
+//==================================================================
+// FUNCTION: Validate SL distance against broker minimum
+//==================================================================
+
+double GetMinimumStopDistance()
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   if(stopsLevel < 0)
+      stopsLevel = 0;
+
+   return (double)stopsLevel * _Point;
+}
+
+//==================================================================
+// FUNCTION: Open BUY
+//==================================================================
+
+bool OpenBuy(const double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("ERROR: Unable to get tick data for BUY.");
+      return false;
+   }
+
+   //--- ATR based risk distance
+   double stopDistance = atrValue * InpATRMultiplier;
+
+   //--- Respect broker minimum stop distance
+   double minimumStopDistance = GetMinimumStopDistance();
+
+   if(stopDistance < minimumStopDistance)
+      stopDistance = minimumStopDistance;
+
+   if(stopDistance <= 0.0)
+   {
+      Print("ERROR: Invalid BUY stop distance.");
+      return false;
+   }
+
+   //--- BUY SL below entry
+   double stopLoss = tick.ask - stopDistance;
+
+   //--- TP = Entry + (SL distance * Risk Reward)
+   double takeProfit = tick.ask + (stopDistance * InpRiskReward);
+
+   //--- Normalize prices
+   stopLoss   = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Validate resulting prices
+   if(stopLoss <= 0.0 || takeProfit <= tick.ask)
+   {
+      Print("ERROR: Invalid BUY SL/TP calculation.");
+      return false;
+   }
+
+   double volume = NormalizeLotSize(InpLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("ERROR: Invalid lot size.");
+      return false;
+   }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EMA Crossover BUY"
+   );
+
+   if(!result)
+   {
+      PrintFormat(
+         "BUY FAILED. Retcode=%u | %s",
+         trade.ResultRetcode(),
+         trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   PrintFormat(
+      "BUY OPENED | Volume=%.2f | Entry=%.5f | SL=%.5f | TP=%.5f",
+      volume,
+      tick.ask,
+      stopLoss,
+      takeProfit
+   );
+
+   return true;
+}
+
+//==================================================================
+// FUNCTION: Open SELL
+//==================================================================
+
+bool OpenSell(const double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("ERROR: Unable to get tick data for SELL.");
+      return false;
+   }
+
+   //--- ATR based risk distance
+   double stopDistance = atrValue * InpATRMultiplier;
+
+   //--- Respect broker minimum stop distance
+   double minimumStopDistance = GetMinimumStopDistance();
+
+   if(stopDistance < minimumStopDistance)
+      stopDistance = minimumStopDistance;
+
+   if(stopDistance <= 0.0)
+   {
+      Print("ERROR: Invalid SELL stop distance.");
+      return false;
+   }
+
+   //--- SELL SL above entry
+   double stopLoss = tick.bid + stopDistance;
+
+   //--- TP = Entry - (SL distance * Risk Reward)
+   double takeProfit = tick.bid - (stopDistance * InpRiskReward);
+
+   //--- Normalize prices
+   stopLoss   = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Validate resulting prices
+   if(stopLoss <= tick.bid || takeProfit <= 0.0 || takeProfit >= tick.bid)
+   {
+      Print("ERROR: Invalid SELL SL/TP calculation.");
+      return false;
+   }
+
+   double volume = NormalizeLotSize(InpLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("ERROR: Invalid lot size.");
+      return false;
+   }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EMA Crossover SELL"
+   );
+
+   if(!result)
+   {
+      PrintFormat(
+         "SELL FAILED. Retcode=%u | %s",
+         trade.ResultRetcode(),
+         trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   PrintFormat(
+      "SELL OPENED | Volume=%.2f | Entry=%.5f | SL=%.5f | TP=%.5f",
+      volume,
+      tick.bid,
+      stopLoss,
+      takeProfit
+   );
+
+   return true;
+}
+
+//==================================================================
+// FUNCTION: Process trading signal
+//==================================================================
+
+void CheckTradingSignal()
+{
+   //--- Do not trade if another position already exists
+   if(HasPositionOnSymbol())
+      return;
+
+   //--- Spread filter
+   if(!IsSpreadAcceptable())
+      return;
+
+   double fastBar1 = 0.0;
+   double fastBar2 = 0.0;
+   double slowBar1 = 0.0;
+   double slowBar2 = 0.0;
+
+   if(!GetEMAValues(
+      fastBar1,
+      fastBar2,
+      slowBar1,
+      slowBar2
+   ))
+   {
+      return;
+   }
+
+   //--- Get ATR from closed candle
+   double atrValue = 0.0;
+
+   if(!GetATR(atrValue))
+      return;
+
+   //==============================================================
+   // BUY CROSSOVER
+   //
+   // Bar 2:
+   // Fast EMA <= Slow EMA
+   //
+   // Bar 1:
+   // Fast EMA > Slow EMA
+   //
+   // This confirms an upward crossover on a CLOSED candle.
+   //==============================================================
+
+   bool buySignal =
+      (fastBar2 <= slowBar2 &&
+       fastBar1 > slowBar1);
+
+   //==============================================================
+   // SELL CROSSOVER
+   //
+   // Bar 2:
+   // Fast EMA >= Slow EMA
+   //
+   // Bar 1:
+   // Fast EMA < Slow EMA
+   //
+   // This confirms a downward crossover on a CLOSED candle.
+   //==============================================================
+
+   bool sellSignal =
+      (fastBar2 >= slowBar2 &&
+       fastBar1 < slowBar1);
+
+   //--- Execute BUY
+   if(buySignal)
+   {
+      Print(
+         "BUY SIGNAL: Fast EMA crossed above Slow EMA."
+      );
+
+      OpenBuy(atrValue);
+      return;
+   }
+
+   //--- Execute SELL
+   if(sellSignal)
+   {
+      Print(
+         "SELL SIGNAL: Fast EMA crossed below Slow EMA."
+      );
+
+      OpenSell(atrValue);
+      return;
+   }
+}
+
+//==================================================================
+// EXPERT INITIALIZATION
+//==================================================================
+
+int OnInit()
+{
+   //--- Basic input validation
+   if(InpFastEMAPeriod <= 0)
+   {
+      Print("ERROR: Fast EMA Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpSlowEMAPeriod <= 0)
+   {
+      Print("ERROR: Slow EMA Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpFastEMAPeriod >= InpSlowEMAPeriod)
+   {
+      Print(
+         "ERROR: Fast EMA Period should be smaller than Slow EMA Period."
+      );
+
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpATRPeriod <= 0)
+   {
+      Print("ERROR: ATR Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpATRMultiplier <= 0.0)
+   {
+      Print("ERROR: ATR Multiplier must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpRiskReward <= 0.0)
+   {
+      Print("ERROR: Risk Reward must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpLotSize <= 0.0)
+   {
+      Print("ERROR: Lot Size must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpMaxSpread <= 0.0)
+   {
+      Print("ERROR: Maximum Spread must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //==============================================================
+   // CREATE INDICATOR HANDLES
+   //==============================================================
+
+   g_fastEMAHandle = iMA(
+      _Symbol,
+      _Period,
+      InpFastEMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   if(g_fastEMAHandle == INVALID_HANDLE)
+   {
+      PrintFormat(
+         "ERROR: Failed to create Fast EMA handle. Error=%d",
+         GetLastError()
+      );
+
+      return INIT_FAILED;
+   }
+
+   g_slowEMAHandle = iMA(
+      _Symbol,
+      _Period,
+      InpSlowEMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   if(g_slowEMAHandle == INVALID_HANDLE)
+   {
+      PrintFormat(
+         "ERROR: Failed to create Slow EMA handle. Error=%d",
+         GetLastError()
+      );
+
+      IndicatorRelease(g_fastEMAHandle);
+      g_fastEMAHandle = INVALID_HANDLE;
+
+      return INIT_FAILED;
+   }
+
+   g_atrHandle = iATR(
+      _Symbol,
+      _Period,
+      InpATRPeriod
+   );
+
+   if(g_atrHandle == INVALID_HANDLE)
+   {
+      PrintFormat(
+         "ERROR: Failed to create ATR handle. Error=%d",
+         GetLastError()
+      );
+
+      IndicatorRelease(g_fastEMAHandle);
+      IndicatorRelease(g_slowEMAHandle);
+
+      g_fastEMAHandle = INVALID_HANDLE;
+      g_slowEMAHandle = INVALID_HANDLE;
+
+      return INIT_FAILED;
+   }
+
+   //==============================================================
+   // INITIALIZE TRADE OBJECT
+   //==============================================================
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- Initialize current bar time.
+   //--- This prevents an immediate duplicate signal when attaching
+   //--- the EA during an already-running candle.
+   g_lastBarTime = iTime(_Symbol, _Period, 0);
+
+   Print("==================================================");
+   Print("EMA Crossover ATR EA initialized successfully.");
+   PrintFormat("Symbol: %s", _Symbol);
+   PrintFormat("Timeframe: %s", EnumToString(_Period));
+   PrintFormat("Fast EMA: %d", InpFastEMAPeriod);
+   PrintFormat("Slow EMA: %d", InpSlowEMAPeriod);
+   PrintFormat("ATR Period: %d", InpATRPeriod);
+   PrintFormat("ATR Multiplier: %.2f", InpATRMultiplier);
+   PrintFormat("Risk Reward: 1:%.2f", InpRiskReward);
+   PrintFormat("Lot Size: %.2f", InpLotSize);
+   PrintFormat("Maximum Spread: %.1f points", InpMaxSpread);
+   PrintFormat("Magic Number: %I64u", InpMagicNumber);
+   Print("==================================================");
+
+   return INIT_SUCCEEDED;
+}
+
+//==================================================================
+// EXPERT DEINITIALIZATION
+//==================================================================
+
+void OnDeinit(const int reason)
+{
+   //--- Release indicator handles
+   if(g_fastEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_fastEMAHandle);
+      g_fastEMAHandle = INVALID_HANDLE;
+   }
+
+   if(g_slowEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_slowEMAHandle);
+      g_slowEMAHandle = INVALID_HANDLE;
+   }
+
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
+
+   PrintFormat(
+      "EMA Crossover ATR EA deinitialized. Reason=%d",
+      reason
+   );
+}
+
+//==================================================================
+// EXPERT TICK FUNCTION
+//==================================================================
+
+void OnTick()
+{
+   //--- Evaluate only once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Signal processing occurs once after a new candle appears.
+   //--- All indicators are read from bar 1 and bar 2.
+   CheckTradingSignal();
+}
+//+------------------------------------------------------------------+

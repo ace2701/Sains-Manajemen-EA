@@ -1,0 +1,502 @@
+//+------------------------------------------------------------------+
+//|                                             MACD_Percentage_EA.mq5|
+//|                        MACD Percentage Strategy for MetaTrader 5  |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "MACD Percentage EA using closed-candle signals and ATR-based risk management."
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- Optimization inputs
+input int      InpMACDFastPeriod      = 12;       // MACD Fast EMA Period
+input int      InpMACDSlowPeriod      = 26;       // MACD Slow EMA Period
+input int      InpMACDSignalPeriod    = 9;        // MACD Signal Period
+input double   InpMACDPercentThreshold = 0.10;    // MACD Percentage Threshold
+input int      InpATRPeriod           = 14;       // ATR Period
+input double   InpATRSLMultiplier     = 2.0;      // ATR Stop Loss Multiplier
+input double   InpRiskReward          = 2.0;      // Risk:Reward Ratio
+input double   InpLotSize             = 0.10;     // Fixed Lot Size
+input double   InpMaxSpread           = 30.0;     // Maximum Spread (points)
+input ulong    InpMagicNumber         = 26091301; // Magic Number
+
+//--- Indicator handles
+int macdHandle = INVALID_HANDLE;
+int atrHandle  = INVALID_HANDLE;
+
+//--- New candle tracking
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate inputs
+   if(InpMACDFastPeriod <= 0 ||
+      InpMACDSlowPeriod <= 0 ||
+      InpMACDSignalPeriod <= 0)
+   {
+      Print("Invalid MACD period settings.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpMACDFastPeriod >= InpMACDSlowPeriod)
+   {
+      Print("MACD Fast EMA Period must be smaller than Slow EMA Period.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpMACDPercentThreshold <= 0.0)
+   {
+      Print("MACD Percentage Threshold must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpATRPeriod <= 0 || InpATRSLMultiplier <= 0.0)
+   {
+      Print("Invalid ATR settings.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpRiskReward <= 0.0)
+   {
+      Print("Risk:Reward Ratio must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpLotSize <= 0.0)
+   {
+      Print("Lot Size must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpMaxSpread <= 0.0)
+   {
+      Print("Maximum Spread must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create MACD handle
+   macdHandle = iMACD(
+      _Symbol,
+      PERIOD_CURRENT,
+      InpMACDFastPeriod,
+      InpMACDSlowPeriod,
+      InpMACDSignalPeriod,
+      PRICE_CLOSE
+   );
+
+   if(macdHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create MACD indicator handle. Error: ",
+            GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      InpATRPeriod
+   );
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR indicator handle. Error: ",
+            GetLastError());
+
+      IndicatorRelease(macdHandle);
+      macdHandle = INVALID_HANDLE;
+
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- Initialize last bar
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(macdHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(macdHandle);
+      macdHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Only evaluate once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Make sure enough indicator data exists
+   if(Bars(_Symbol, PERIOD_CURRENT) < 100)
+      return;
+
+   //--- Spread filter
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Only one position for this EA on this symbol
+   if(HasOpenPosition())
+      return;
+
+   //--- Calculate MACD Percentage for bars 1 and 2
+   double macdValues[3];
+
+   ArraySetAsSeries(macdValues, true);
+
+   if(CopyBuffer(macdHandle, 0, 0, 3, macdValues) < 3)
+   {
+      Print("Failed to copy MACD data. Error: ", GetLastError());
+      return;
+   }
+
+   //--- Closed candle prices
+   double closeBar1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double closeBar2 = iClose(_Symbol, PERIOD_CURRENT, 2);
+
+   if(closeBar1 <= 0.0 || closeBar2 <= 0.0)
+      return;
+
+   //--- MACD Percentage
+   double macdPercentBar1 =
+      (macdValues[1] / closeBar1) * 100.0;
+
+   double macdPercentBar2 =
+      (macdValues[2] / closeBar2) * 100.0;
+
+   //--- Thresholds
+   double positiveThreshold = InpMACDPercentThreshold;
+   double negativeThreshold = -InpMACDPercentThreshold;
+
+   //--- BUY:
+   // Bar 2 was below/equal threshold
+   // Bar 1 crossed above threshold
+   bool buySignal =
+      (macdPercentBar2 <= positiveThreshold &&
+       macdPercentBar1 > positiveThreshold);
+
+   //--- SELL:
+   // Bar 2 was above/equal negative threshold
+   // Bar 1 crossed below negative threshold
+   bool sellSignal =
+      (macdPercentBar2 >= negativeThreshold &&
+       macdPercentBar1 < negativeThreshold);
+
+   //--- Execute signal
+   if(buySignal)
+   {
+      OpenBuy();
+   }
+   else if(sellSignal)
+   {
+      OpenSell();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect new candle                                                |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(
+      _Symbol,
+      PERIOD_CURRENT,
+      0
+   );
+
+   if(currentBarTime == 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check maximum spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Failed to obtain current tick.");
+      return false;
+   }
+
+   double spreadPoints =
+      (tick.ask - tick.bid) / _Point;
+
+   if(spreadPoints > InpMaxSpread)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position                      |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == InpMagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get ATR value from closed candle                                 |
+//+------------------------------------------------------------------+
+double GetATR()
+{
+   double atrValues[2];
+
+   ArraySetAsSeries(atrValues, true);
+
+   if(CopyBuffer(atrHandle, 0, 0, 2, atrValues) < 2)
+   {
+      Print("Failed to copy ATR data. Error: ", GetLastError());
+      return 0.0;
+   }
+
+   //--- Use closed candle ATR (bar 1)
+   return atrValues[1];
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double lots)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep <= 0.0)
+      return 0.0;
+
+   lots = MathMax(lots, minLot);
+   lots = MathMin(lots, maxLot);
+
+   lots = MathFloor(lots / lotStep) * lotStep;
+
+   int volumeDigits = 0;
+
+   double step = lotStep;
+
+   while(step < 1.0 && volumeDigits < 8)
+   {
+      step *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(lots, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("BUY failed: unable to obtain tick.");
+      return;
+   }
+
+   double atr = GetATR();
+
+   if(atr <= 0.0)
+   {
+      Print("BUY failed: invalid ATR.");
+      return;
+   }
+
+   double lot = NormalizeLotSize(InpLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("BUY failed: invalid normalized lot size.");
+      return;
+   }
+
+   //--- ATR based risk
+   double riskDistance = atr * InpATRSLMultiplier;
+
+   //--- BUY SL below entry
+   double sl = tick.ask - riskDistance;
+
+   //--- BUY TP above entry
+   double tp = tick.ask +
+               (riskDistance * InpRiskReward);
+
+   //--- Respect broker stop level
+   double stopLevel =
+      (double)SymbolInfoInteger(
+         _Symbol,
+         SYMBOL_TRADE_STOPS_LEVEL
+      ) * _Point;
+
+   if(stopLevel > 0.0)
+   {
+      if((tick.ask - sl) < stopLevel)
+         sl = tick.ask - stopLevel;
+
+      if((tp - tick.ask) < stopLevel)
+         tp = tick.ask + stopLevel;
+   }
+
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      lot,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "MACD Percentage BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("SELL failed: unable to obtain tick.");
+      return;
+   }
+
+   double atr = GetATR();
+
+   if(atr <= 0.0)
+   {
+      Print("SELL failed: invalid ATR.");
+      return;
+   }
+
+   double lot = NormalizeLotSize(InpLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("SELL failed: invalid normalized lot size.");
+      return;
+   }
+
+   //--- ATR based risk
+   double riskDistance = atr * InpATRSLMultiplier;
+
+   //--- SELL SL above entry
+   double sl = tick.bid + riskDistance;
+
+   //--- SELL TP below entry
+   double tp = tick.bid -
+               (riskDistance * InpRiskReward);
+
+   //--- Respect broker stop level
+   double stopLevel =
+      (double)SymbolInfoInteger(
+         _Symbol,
+         SYMBOL_TRADE_STOPS_LEVEL
+      ) * _Point;
+
+   if(stopLevel > 0.0)
+   {
+      if((sl - tick.bid) < stopLevel)
+         sl = tick.bid + stopLevel;
+
+      if((tick.bid - tp) < stopLevel)
+         tp = tick.bid - stopLevel;
+   }
+
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      lot,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "MACD Percentage SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+   }
+}
+//+------------------------------------------------------------------+

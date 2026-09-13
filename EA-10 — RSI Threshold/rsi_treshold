@@ -1,0 +1,713 @@
+//+------------------------------------------------------------------+
+//|                                                EA-10 RSI Threshold|
+//|                         Native MQL5 Expert Advisor                |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-10 - RSI Threshold Momentum Re-Entry"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- General
+input ulong  MagicNumber = 9010;       // Unique magic number
+input double LotSize = 0.10;           // Fixed lot size
+input int    MaxSpreadPoints = 50;     // Maximum allowed spread in points
+
+//--- RSI Strategy
+input int    RSI_Period = 14;                 // RSI calculation period
+input double LowerThreshold = 30.0;           // Lower RSI threshold
+input double UpperThreshold = 70.0;           // Upper RSI threshold
+input bool   UseRSIMomentumFilter = false;    // Enable RSI momentum filter
+input double RSIMomentumMinimum = 2.0;        // Minimum RSI movement
+
+//--- Risk Management
+input double StopLossPercent = 0.50;      // Stop Loss percentage
+input double RiskRewardRatio = 1.50;      // Risk/Reward ratio
+
+//--- Exit
+input bool UseRSIExit = false;             // Enable RSI-based exit
+
+//--- Trading Hours
+input bool UseTradingHours = false;       // Enable trading-hour filter
+input int  StartHour = 0;                 // Trading start hour
+input int  EndHour = 23;                  // Trading end hour
+
+//--- Global variables
+int      rsiHandle = INVALID_HANDLE;
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate RSI settings
+   if(RSI_Period < 1)
+   {
+      Print("Invalid RSI_Period.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(LowerThreshold >= UpperThreshold)
+   {
+      Print("Invalid RSI thresholds: LowerThreshold must be below UpperThreshold.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(LowerThreshold <= 0.0 || UpperThreshold >= 100.0)
+   {
+      Print("Invalid RSI threshold values.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(StopLossPercent <= 0.0)
+   {
+      Print("StopLossPercent must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("RiskRewardRatio must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(LotSize <= 0.0)
+   {
+      Print("LotSize must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(StartHour < 0 || StartHour > 23 ||
+      EndHour < 0 || EndHour > 23)
+   {
+      Print("Trading hours must be between 0 and 23.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   //--- Create RSI handle
+   rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+
+   if(rsiHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create RSI handle. Error: ", GetLastError());
+      return(INIT_FAILED);
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   //--- Initialize current bar
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(rsiHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(rsiHandle);
+      rsiHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Entry and RSI exit logic only once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Make sure enough RSI data exists
+   double rsiBar2 = 0.0;
+   double rsiBar1 = 0.0;
+
+   if(!GetRSIValues(rsiBar2, rsiBar1))
+      return;
+
+   //--- Manage existing position first
+   if(HasOpenPosition())
+   {
+      if(UseRSIExit)
+      {
+         if(ManagePositions(rsiBar1))
+            return;
+      }
+
+      //--- One position maximum for this EA
+      return;
+   }
+
+   //--- Check trading conditions
+   if(!IsTradingTime())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- BUY threshold crossback
+   bool buySignal = false;
+
+   if(rsiBar2 <= LowerThreshold &&
+      rsiBar1 > LowerThreshold &&
+      rsiBar1 < UpperThreshold)
+   {
+      buySignal = true;
+
+      if(UseRSIMomentumFilter)
+      {
+         if((rsiBar1 - rsiBar2) < RSIMomentumMinimum)
+            buySignal = false;
+      }
+   }
+
+   //--- SELL threshold crossback
+   bool sellSignal = false;
+
+   if(rsiBar2 >= UpperThreshold &&
+      rsiBar1 < UpperThreshold &&
+      rsiBar1 > LowerThreshold)
+   {
+      sellSignal = true;
+
+      if(UseRSIMomentumFilter)
+      {
+         if((rsiBar2 - rsiBar1) < RSIMomentumMinimum)
+            sellSignal = false;
+      }
+   }
+
+   //--- Execute signal
+   if(buySignal)
+   {
+      OpenBuy();
+      return;
+   }
+
+   if(sellSignal)
+   {
+      OpenSell();
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect a new candle                                              |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get RSI values                                                    |
+//| rsiBar2 = candle 2                                               |
+//| rsiBar1 = latest closed candle 1                                 |
+//+------------------------------------------------------------------+
+bool GetRSIValues(double &rsiBar2, double &rsiBar1)
+{
+   if(rsiHandle == INVALID_HANDLE)
+      return false;
+
+   if(BarsCalculated(rsiHandle) < 3)
+      return false;
+
+   double rsiValues[2];
+
+   ResetLastError();
+
+   int copied = CopyBuffer(
+      rsiHandle,
+      0,
+      1,
+      2,
+      rsiValues
+   );
+
+   if(copied != 2)
+   {
+      return false;
+   }
+
+   // CopyBuffer(start=1,count=2):
+   // rsiValues[0] = bar 2
+   // rsiValues[1] = bar 1
+   rsiBar2 = rsiValues[0];
+   rsiBar1 = rsiValues[1];
+
+   if(!MathIsValidNumber(rsiBar2) ||
+      !MathIsValidNumber(rsiBar1))
+   {
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position on this symbol       |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         (ulong)magic == MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get this EA's position ticket                                    |
+//+------------------------------------------------------------------+
+ulong GetPositionTicket()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         (ulong)magic == MagicNumber)
+      {
+         return ticket;
+      }
+   }
+
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check trading hours                                              |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   //--- Same start/end hour means full-day availability
+   if(StartHour == EndHour)
+      return true;
+
+   //--- Normal session
+   if(StartHour < EndHour)
+   {
+      if(hour >= StartHour && hour <= EndHour)
+         return true;
+
+      return false;
+   }
+
+   //--- Overnight session, e.g. 22 -> 6
+   if(hour >= StartHour || hour <= EndHour)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check current spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   if(tick.ask <= 0.0 || tick.bid <= 0.0)
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   if(spreadPoints > (double)MaxSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size according to broker settings                  |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+   double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volumeMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(volumeMin <= 0.0 ||
+      volumeMax <= 0.0 ||
+      volumeStep <= 0.0)
+   {
+      return 0.0;
+   }
+
+   double volume = LotSize;
+
+   //--- Respect broker limits
+   volume = MathMax(volume, volumeMin);
+   volume = MathMin(volume, volumeMax);
+
+   //--- Normalize to volume step
+   double steps = MathFloor((volume - volumeMin) / volumeStep + 0.5);
+   volume = volumeMin + steps * volumeStep;
+
+   volume = MathMax(volume, volumeMin);
+   volume = MathMin(volume, volumeMax);
+
+   int volumeDigits = GetVolumeDigits(volumeStep);
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Determine volume decimal places                                  |
+//+------------------------------------------------------------------+
+int GetVolumeDigits(const double step)
+{
+   if(step >= 1.0)
+      return 0;
+
+   if(step >= 0.1)
+      return 1;
+
+   if(step >= 0.01)
+      return 2;
+
+   if(step >= 0.001)
+      return 3;
+
+   return 4;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Get broker minimum stop distance                                 |
+//+------------------------------------------------------------------+
+double GetMinimumStopDistance()
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   if(stopsLevel < 0)
+      stopsLevel = 0;
+
+   return (double)stopsLevel * _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   if(tick.ask <= 0.0)
+      return;
+
+   double entryPrice = NormalizePrice(tick.ask);
+
+   //--- Percentage-based SL
+   double riskDistance =
+      entryPrice * StopLossPercent / 100.0;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   double minimumDistance = GetMinimumStopDistance();
+
+   //--- Do not distort the requested percentage risk.
+   //--- Skip the trade if broker minimum is larger.
+   if(riskDistance < minimumDistance)
+   {
+      Print("BUY skipped: calculated SL distance is below broker minimum stop distance.");
+      return;
+   }
+
+   double stopLoss =
+      NormalizePrice(entryPrice - riskDistance);
+
+   double takeProfit =
+      NormalizePrice(entryPrice +
+                     riskDistance * RiskRewardRatio);
+
+   //--- Final broker distance validation
+   if((entryPrice - stopLoss) < minimumDistance)
+   {
+      Print("BUY skipped: invalid SL distance.");
+      return;
+   }
+
+   if((takeProfit - entryPrice) < minimumDistance)
+   {
+      Print("BUY skipped: invalid TP distance.");
+      return;
+   }
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+   {
+      Print("BUY skipped: invalid normalized lot size.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-10 RSI Threshold BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY order failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " Error=",
+         GetLastError()
+      );
+   }
+   else
+   {
+      Print(
+         "BUY opened. Price=",
+         entryPrice,
+         " SL=",
+         stopLoss,
+         " TP=",
+         takeProfit
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   if(tick.bid <= 0.0)
+      return;
+
+   double entryPrice = NormalizePrice(tick.bid);
+
+   //--- Percentage-based SL
+   double riskDistance =
+      entryPrice * StopLossPercent / 100.0;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   double minimumDistance = GetMinimumStopDistance();
+
+   //--- Do not distort requested percentage risk
+   if(riskDistance < minimumDistance)
+   {
+      Print("SELL skipped: calculated SL distance is below broker minimum stop distance.");
+      return;
+   }
+
+   double stopLoss =
+      NormalizePrice(entryPrice + riskDistance);
+
+   double takeProfit =
+      NormalizePrice(entryPrice -
+                     riskDistance * RiskRewardRatio);
+
+   //--- Final broker distance validation
+   if((stopLoss - entryPrice) < minimumDistance)
+   {
+      Print("SELL skipped: invalid SL distance.");
+      return;
+   }
+
+   if((entryPrice - takeProfit) < minimumDistance)
+   {
+      Print("SELL skipped: invalid TP distance.");
+      return;
+   }
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+   {
+      Print("SELL skipped: invalid normalized lot size.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-10 RSI Threshold SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL order failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " Error=",
+         GetLastError()
+      );
+   }
+   else
+   {
+      Print(
+         "SELL opened. Price=",
+         entryPrice,
+         " SL=",
+         stopLoss,
+         " TP=",
+         takeProfit
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing position with optional RSI exit                 |
+//+------------------------------------------------------------------+
+bool ManagePositions(const double rsiBar1)
+{
+   ulong ticket = GetPositionTicket();
+
+   if(ticket == 0)
+      return false;
+
+   if(!PositionSelectByTicket(ticket))
+      return false;
+
+   ENUM_POSITION_TYPE positionType =
+      (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   bool shouldClose = false;
+
+   //--- BUY exits when RSI reaches upper threshold
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      if(rsiBar1 >= UpperThreshold)
+         shouldClose = true;
+   }
+
+   //--- SELL exits when RSI reaches lower threshold
+   if(positionType == POSITION_TYPE_SELL)
+   {
+      if(rsiBar1 <= LowerThreshold)
+         shouldClose = true;
+   }
+
+   if(!shouldClose)
+      return false;
+
+   ResetLastError();
+
+   bool result = trade.PositionClose(ticket);
+
+   if(!result)
+   {
+      Print(
+         "Position close failed. Ticket=",
+         ticket,
+         " Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " Error=",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   Print(
+      "RSI exit executed. Ticket=",
+      ticket,
+      " RSI=",
+      DoubleToString(rsiBar1, 2)
+   );
+
+   return true;
+}
+//+------------------------------------------------------------------+

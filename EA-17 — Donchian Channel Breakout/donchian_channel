@@ -1,0 +1,1336 @@
+#property strict
+#property version   "1.00"
+#property description "EA-17 - Donchian Channel Breakout"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//==================================================
+// GENERAL
+//==================================================
+input ulong  MagicNumber                  = 17017;
+input double FixedLotSize                 = 0.10;
+input int    MaximumAllowedSpreadPoints   = 50;
+
+//==================================================
+// DONCHIAN
+//==================================================
+input int    DonchianPeriod               = 20;
+input int    BreakoutBufferPoints         = 10;
+
+//==================================================
+// EMA FILTER
+//==================================================
+input bool   EnableEMAFilter              = false;
+input int    EMAPeriod                    = 50;
+
+//==================================================
+// ATR RISK
+//==================================================
+input int    ATRPeriod                    = 14;
+input double ATRStopMultiplier             = 1.5;
+input int    MinimumStopLossPoints        = 100;
+input int    MaximumStopLossPoints        = 600;
+
+//==================================================
+// TAKE PROFIT
+//==================================================
+input double RiskRewardRatio              = 2.0;
+
+//==================================================
+// TRAILING STOP
+//==================================================
+input bool   EnableTrailingStop           = false;
+input double TrailingATRMultiplier        = 1.5;
+
+//==================================================
+// CHANNEL EXIT
+//==================================================
+input bool   EnableChannelExit            = false;
+
+//==================================================
+// TRADING HOURS
+//==================================================
+input bool   EnableTradingHours            = false;
+input int    TradingStartHour             = 0;
+input int    TradingEndHour               = 23;
+
+//==================================================
+// INDICATOR HANDLES
+//==================================================
+int atrHandle = INVALID_HANDLE;
+int emaHandle = INVALID_HANDLE;
+
+//==================================================
+// NEW BAR TRACKING
+//==================================================
+datetime lastBarTime = 0;
+
+//==================================================
+// FUNCTION PROTOTYPES
+//==================================================
+bool   IsNewBar();
+bool   HasEnoughBars();
+bool   IsTradingHour();
+bool   IsSpreadAcceptable();
+bool   HasOwnPosition();
+bool   HasAnySymbolPosition();
+bool   GetATRValue(const int shift, double &value);
+bool   GetEMAValue(const int shift, double &value);
+bool   GetDonchianLevels(const int period, const int startShift,
+                         double &upper, double &lower);
+double NormalizePrice(const double price);
+double NormalizeVolume(const double volume);
+int    VolumeDigits();
+double GetMinimumStopDistancePrice();
+bool   OpenBuy();
+bool   OpenSell();
+void   ManageTrailingStop();
+void   ManageChannelExit();
+void   ProcessEntrySignals();
+bool   CloseOwnPosition();
+bool   IsValidStopLoss(const ENUM_ORDER_TYPE orderType,
+                       const double entryPrice,
+                       const double stopLoss);
+bool   IsValidTakeProfit(const ENUM_ORDER_TYPE orderType,
+                         const double entryPrice,
+                         const double takeProfit);
+
+//==================================================
+// ON INIT
+//==================================================
+int OnInit()
+{
+   if(MagicNumber == 0)
+   {
+      Print("Initialization failed: MagicNumber must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(FixedLotSize <= 0.0)
+   {
+      Print("Initialization failed: FixedLotSize must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(DonchianPeriod < 2)
+   {
+      Print("Initialization failed: DonchianPeriod must be at least 2.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(ATRPeriod < 1)
+   {
+      Print("Initialization failed: ATRPeriod must be at least 1.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(ATRStopMultiplier <= 0.0)
+   {
+      Print("Initialization failed: ATRStopMultiplier must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("Initialization failed: RiskRewardRatio must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(MinimumStopLossPoints < 0 ||
+      MaximumStopLossPoints <= 0 ||
+      MaximumStopLossPoints < MinimumStopLossPoints)
+   {
+      Print("Initialization failed: invalid stop-loss limits.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(BreakoutBufferPoints < 0)
+   {
+      Print("Initialization failed: BreakoutBufferPoints cannot be negative.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(MaximumAllowedSpreadPoints < 0)
+   {
+      Print("Initialization failed: MaximumAllowedSpreadPoints cannot be negative.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(EnableEMAFilter && EMAPeriod < 1)
+   {
+      Print("Initialization failed: EMAPeriod must be at least 1.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(EnableTrailingStop && TrailingATRMultiplier <= 0.0)
+   {
+      Print("Initialization failed: TrailingATRMultiplier must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(EnableTradingHours)
+   {
+      if(TradingStartHour < 0 || TradingStartHour > 23 ||
+         TradingEndHour < 0 || TradingEndHour > 23)
+      {
+         Print("Initialization failed: trading hours must be between 0 and 23.");
+         return(INIT_PARAMETERS_INCORRECT);
+      }
+   }
+
+   atrHandle = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR indicator handle. Error: ", GetLastError());
+      return(INIT_FAILED);
+   }
+
+   if(EnableEMAFilter)
+   {
+      emaHandle = iMA(
+         _Symbol,
+         PERIOD_CURRENT,
+         EMAPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+      if(emaHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create EMA indicator handle. Error: ", GetLastError());
+         IndicatorRelease(atrHandle);
+         atrHandle = INVALID_HANDLE;
+         return(INIT_FAILED);
+      }
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return(INIT_SUCCEEDED);
+}
+
+//==================================================
+// ON DEINIT
+//==================================================
+void OnDeinit(const int reason)
+{
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+
+   if(emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(emaHandle);
+      emaHandle = INVALID_HANDLE;
+   }
+}
+
+//==================================================
+// ON TICK
+//==================================================
+void OnTick()
+{
+   // Position management is allowed on every tick.
+   if(EnableTrailingStop)
+      ManageTrailingStop();
+
+   if(EnableChannelExit && IsNewBar())
+   {
+      ManageChannelExit();
+   }
+
+   // Entry signals are processed only once per new candle.
+   if(IsNewBar())
+   {
+      ProcessEntrySignals();
+   }
+}
+
+//==================================================
+// NEW BAR DETECTION
+//==================================================
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return(false);
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return(true);
+   }
+
+   return(false);
+}
+
+//==================================================
+// HISTORICAL DATA VALIDATION
+//==================================================
+bool HasEnoughBars()
+{
+   int requiredBars = DonchianPeriod + 5;
+
+   if(EnableEMAFilter && EMAPeriod + 5 > requiredBars)
+      requiredBars = EMAPeriod + 5;
+
+   if(ATRPeriod + 5 > requiredBars)
+      requiredBars = ATRPeriod + 5;
+
+   int bars = Bars(_Symbol, PERIOD_CURRENT);
+
+   return(bars >= requiredBars);
+}
+
+//==================================================
+// TRADING HOURS
+//==================================================
+bool IsTradingHour()
+{
+   if(!EnableTradingHours)
+      return(true);
+
+   MqlDateTime tm;
+
+   if(!TimeToStruct(TimeCurrent(), tm))
+      return(false);
+
+   int currentHour = tm.hour;
+
+   // Same start/end means the entire day is permitted.
+   if(TradingStartHour == TradingEndHour)
+      return(true);
+
+   // Normal intraday interval.
+   if(TradingStartHour < TradingEndHour)
+   {
+      return(currentHour >= TradingStartHour &&
+             currentHour <= TradingEndHour);
+   }
+
+   // Overnight interval, e.g. 22 -> 6.
+   return(currentHour >= TradingStartHour ||
+          currentHour <= TradingEndHour);
+}
+
+//==================================================
+// SPREAD FILTER
+//==================================================
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return(false);
+
+   if(tick.ask <= 0.0 || tick.bid <= 0.0)
+      return(false);
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return(spreadPoints <= (double)MaximumAllowedSpreadPoints);
+}
+
+//==================================================
+// CHECK OWN POSITION
+//==================================================
+bool HasOwnPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         (ulong)magic == MagicNumber)
+      {
+         return(true);
+      }
+   }
+
+   return(false);
+}
+
+//==================================================
+// CHECK ANY POSITION ON SYMBOL
+//==================================================
+bool HasAnySymbolPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+         return(true);
+   }
+
+   return(false);
+}
+
+//==================================================
+// ATR VALUE
+//==================================================
+bool GetATRValue(const int shift, double &value)
+{
+   value = 0.0;
+
+   if(atrHandle == INVALID_HANDLE)
+      return(false);
+
+   double buffer[1];
+
+   ResetLastError();
+
+   int copied = CopyBuffer(
+      atrHandle,
+      0,
+      shift,
+      1,
+      buffer
+   );
+
+   if(copied != 1)
+      return(false);
+
+   if(!MathIsValidNumber(buffer[0]) || buffer[0] <= 0.0)
+      return(false);
+
+   value = buffer[0];
+
+   return(true);
+}
+
+//==================================================
+// EMA VALUE
+//==================================================
+bool GetEMAValue(const int shift, double &value)
+{
+   value = 0.0;
+
+   if(emaHandle == INVALID_HANDLE)
+      return(false);
+
+   double buffer[1];
+
+   ResetLastError();
+
+   int copied = CopyBuffer(
+      emaHandle,
+      0,
+      shift,
+      1,
+      buffer
+   );
+
+   if(copied != 1)
+      return(false);
+
+   if(!MathIsValidNumber(buffer[0]) || buffer[0] <= 0.0)
+      return(false);
+
+   value = buffer[0];
+
+   return(true);
+}
+
+//==================================================
+// DONCHIAN CHANNEL
+//
+// startShift = 2
+//
+// Example:
+// DonchianPeriod = 20
+// Uses candles [2] through [21].
+// Candle [1] is NEVER included.
+//==================================================
+bool GetDonchianLevels(const int period,
+                       const int startShift,
+                       double &upper,
+                       double &lower)
+{
+   upper = 0.0;
+   lower = 0.0;
+
+   if(period < 1 || startShift < 1)
+      return(false);
+
+   double highs[];
+   double lows[];
+
+   ArrayResize(highs, period);
+   ArrayResize(lows, period);
+
+   int copiedHigh = CopyHigh(
+      _Symbol,
+      PERIOD_CURRENT,
+      startShift,
+      period,
+      highs
+   );
+
+   int copiedLow = CopyLow(
+      _Symbol,
+      PERIOD_CURRENT,
+      startShift,
+      period,
+      lows
+   );
+
+   if(copiedHigh != period || copiedLow != period)
+      return(false);
+
+   upper = highs[0];
+   lower = lows[0];
+
+   for(int i = 1; i < period; i++)
+   {
+      if(highs[i] > upper)
+         upper = highs[i];
+
+      if(lows[i] < lower)
+         lower = lows[i];
+   }
+
+   if(!MathIsValidNumber(upper) ||
+      !MathIsValidNumber(lower) ||
+      upper <= 0.0 ||
+      lower <= 0.0 ||
+      upper < lower)
+   {
+      return(false);
+   }
+
+   return(true);
+}
+
+//==================================================
+// PRICE NORMALIZATION
+//==================================================
+double NormalizePrice(const double price)
+{
+   return(NormalizeDouble(price, _Digits));
+}
+
+//==================================================
+// VOLUME DIGITS
+//==================================================
+int VolumeDigits()
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(step <= 0.0)
+      return(2);
+
+   int digits = 0;
+
+   while(digits < 8)
+   {
+      double scaled = step * MathPow(10.0, digits);
+
+      if(MathAbs(scaled - MathRound(scaled)) < 0.00000001)
+         break;
+
+      digits++;
+   }
+
+   return(digits);
+}
+
+//==================================================
+// VOLUME NORMALIZATION
+//==================================================
+double NormalizeVolume(const double volume)
+{
+   double minVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      step <= 0.0)
+   {
+      return(0.0);
+   }
+
+   double normalized = volume;
+
+   if(normalized < minVolume)
+      normalized = minVolume;
+
+   if(normalized > maxVolume)
+      normalized = maxVolume;
+
+   normalized = MathFloor((normalized / step) + 0.00000001) * step;
+
+   if(normalized < minVolume)
+      normalized = minVolume;
+
+   if(normalized > maxVolume)
+      normalized = maxVolume;
+
+   return(NormalizeDouble(normalized, VolumeDigits()));
+}
+
+//==================================================
+// BROKER MINIMUM STOP DISTANCE
+//==================================================
+double GetMinimumStopDistancePrice()
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   if(stopsLevel < 0)
+      stopsLevel = 0;
+
+   return((double)stopsLevel * _Point);
+}
+
+//==================================================
+// VALIDATE STOP LOSS
+//==================================================
+bool IsValidStopLoss(const ENUM_ORDER_TYPE orderType,
+                     const double entryPrice,
+                     const double stopLoss)
+{
+   double minimumDistance = GetMinimumStopDistancePrice();
+
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      if(stopLoss >= entryPrice)
+         return(false);
+
+      if((entryPrice - stopLoss) + (_Point * 0.1) < minimumDistance)
+         return(false);
+   }
+   else if(orderType == ORDER_TYPE_SELL)
+   {
+      if(stopLoss <= entryPrice)
+         return(false);
+
+      if((stopLoss - entryPrice) + (_Point * 0.1) < minimumDistance)
+         return(false);
+   }
+   else
+   {
+      return(false);
+   }
+
+   return(true);
+}
+
+//==================================================
+// VALIDATE TAKE PROFIT
+//==================================================
+bool IsValidTakeProfit(const ENUM_ORDER_TYPE orderType,
+                       const double entryPrice,
+                       const double takeProfit)
+{
+   double minimumDistance = GetMinimumStopDistancePrice();
+
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      if(takeProfit <= entryPrice)
+         return(false);
+
+      if((takeProfit - entryPrice) + (_Point * 0.1) < minimumDistance)
+         return(false);
+   }
+   else if(orderType == ORDER_TYPE_SELL)
+   {
+      if(takeProfit >= entryPrice)
+         return(false);
+
+      if((entryPrice - takeProfit) + (_Point * 0.1) < minimumDistance)
+         return(false);
+   }
+   else
+   {
+      return(false);
+   }
+
+   return(true);
+}
+
+//==================================================
+// BUY ENTRY
+//==================================================
+bool OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return(false);
+
+   if(tick.ask <= 0.0)
+      return(false);
+
+   double atr = 0.0;
+
+   if(!GetATRValue(1, atr))
+      return(false);
+
+   double atrDistance = atr * ATRStopMultiplier;
+
+   if(!MathIsValidNumber(atrDistance) || atrDistance <= 0.0)
+      return(false);
+
+   double stopDistance = atrDistance;
+
+   double minimumConfigured =
+      (double)MinimumStopLossPoints * _Point;
+
+   double maximumConfigured =
+      (double)MaximumStopLossPoints * _Point;
+
+   if(stopDistance < minimumConfigured)
+      stopDistance = minimumConfigured;
+
+   if(stopDistance > maximumConfigured)
+      stopDistance = maximumConfigured;
+
+   double brokerMinimum = GetMinimumStopDistancePrice();
+
+   if(stopDistance < brokerMinimum)
+      stopDistance = brokerMinimum;
+
+   // Add one point to avoid equality with broker stop-level boundary.
+   if(stopDistance <= brokerMinimum)
+      stopDistance = brokerMinimum + _Point;
+
+   double entryPrice = tick.ask;
+
+   double stopLoss = NormalizePrice(
+      entryPrice - stopDistance
+   );
+
+   if(!IsValidStopLoss(
+      ORDER_TYPE_BUY,
+      entryPrice,
+      stopLoss))
+   {
+      return(false);
+   }
+
+   double actualRisk = entryPrice - stopLoss;
+
+   if(actualRisk <= 0.0)
+      return(false);
+
+   double takeProfit = NormalizePrice(
+      entryPrice + (actualRisk * RiskRewardRatio)
+   );
+
+   if(!IsValidTakeProfit(
+      ORDER_TYPE_BUY,
+      entryPrice,
+      takeProfit))
+   {
+      return(false);
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return(false);
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-17 Donchian BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY order failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " Error=",
+         GetLastError()
+      );
+
+      return(false);
+   }
+
+   if(trade.ResultDeal() == 0 &&
+      trade.ResultOrder() == 0)
+   {
+      Print(
+         "BUY execution returned no deal/order. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+
+      return(false);
+   }
+
+   return(true);
+}
+
+//==================================================
+// SELL ENTRY
+//==================================================
+bool OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return(false);
+
+   if(tick.bid <= 0.0)
+      return(false);
+
+   double atr = 0.0;
+
+   if(!GetATRValue(1, atr))
+      return(false);
+
+   double atrDistance = atr * ATRStopMultiplier;
+
+   if(!MathIsValidNumber(atrDistance) || atrDistance <= 0.0)
+      return(false);
+
+   double stopDistance = atrDistance;
+
+   double minimumConfigured =
+      (double)MinimumStopLossPoints * _Point;
+
+   double maximumConfigured =
+      (double)MaximumStopLossPoints * _Point;
+
+   if(stopDistance < minimumConfigured)
+      stopDistance = minimumConfigured;
+
+   if(stopDistance > maximumConfigured)
+      stopDistance = maximumConfigured;
+
+   double brokerMinimum = GetMinimumStopDistancePrice();
+
+   if(stopDistance < brokerMinimum)
+      stopDistance = brokerMinimum;
+
+   if(stopDistance <= brokerMinimum)
+      stopDistance = brokerMinimum + _Point;
+
+   double entryPrice = tick.bid;
+
+   double stopLoss = NormalizePrice(
+      entryPrice + stopDistance
+   );
+
+   if(!IsValidStopLoss(
+      ORDER_TYPE_SELL,
+      entryPrice,
+      stopLoss))
+   {
+      return(false);
+   }
+
+   double actualRisk = stopLoss - entryPrice;
+
+   if(actualRisk <= 0.0)
+      return(false);
+
+   double takeProfit = NormalizePrice(
+      entryPrice - (actualRisk * RiskRewardRatio)
+   );
+
+   if(!IsValidTakeProfit(
+      ORDER_TYPE_SELL,
+      entryPrice,
+      takeProfit))
+   {
+      return(false);
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return(false);
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-17 Donchian SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL order failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " Error=",
+         GetLastError()
+      );
+
+      return(false);
+   }
+
+   if(trade.ResultDeal() == 0 &&
+      trade.ResultOrder() == 0)
+   {
+      Print(
+         "SELL execution returned no deal/order. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+
+      return(false);
+   }
+
+   return(true);
+}
+
+//==================================================
+// ENTRY SIGNAL PROCESSING
+//==================================================
+void ProcessEntrySignals()
+{
+   if(!HasEnoughBars())
+      return;
+
+   // Never create another position when this EA already owns one.
+   if(HasOwnPosition())
+      return;
+
+   // Prevent conflicts with an existing position on the symbol,
+   // particularly important for netting accounts.
+   if(HasAnySymbolPosition())
+      return;
+
+   if(!IsTradingHour())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   double upperBreakout = 0.0;
+   double lowerBreakout = 0.0;
+
+   // IMPORTANT:
+   // Uses [2] through [DonchianPeriod+1].
+   // The signal candle [1] is excluded.
+   if(!GetDonchianLevels(
+      DonchianPeriod,
+      2,
+      upperBreakout,
+      lowerBreakout))
+   {
+      return;
+   }
+
+   double close1 = iClose(
+      _Symbol,
+      PERIOD_CURRENT,
+      1
+   );
+
+   double close2 = iClose(
+      _Symbol,
+      PERIOD_CURRENT,
+      2
+   );
+
+   if(close1 <= 0.0 || close2 <= 0.0)
+      return;
+
+   double buffer = (double)BreakoutBufferPoints * _Point;
+
+   //==================================================
+   // BUY SIGNAL
+   //==================================================
+   bool buySignal =
+      (close1 > (upperBreakout + buffer)) &&
+      (close2 <= upperBreakout);
+
+   //==================================================
+   // SELL SIGNAL
+   //==================================================
+   bool sellSignal =
+      (close1 < (lowerBreakout - buffer)) &&
+      (close2 >= lowerBreakout);
+
+   //==================================================
+   // OPTIONAL EMA FILTER
+   //==================================================
+   if(EnableEMAFilter &&
+      (buySignal || sellSignal))
+   {
+      double ema1 = 0.0;
+
+      if(!GetEMAValue(1, ema1))
+         return;
+
+      if(buySignal && close1 <= ema1)
+         buySignal = false;
+
+      if(sellSignal && close1 >= ema1)
+         sellSignal = false;
+   }
+
+   // A single closed candle can never produce both
+   // valid signals because upper > lower.
+   if(buySignal)
+   {
+      OpenBuy();
+      return;
+   }
+
+   if(sellSignal)
+   {
+      OpenSell();
+      return;
+   }
+}
+
+//==================================================
+// ATR TRAILING STOP
+//==================================================
+void ManageTrailingStop()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol ||
+         (ulong)magic != MagicNumber)
+      {
+         continue;
+      }
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(
+            POSITION_TYPE
+         );
+
+      double currentSL =
+         PositionGetDouble(POSITION_SL);
+
+      double currentTP =
+         PositionGetDouble(POSITION_TP);
+
+      double atr = 0.0;
+
+      // Trailing uses the latest CLOSED candle ATR.
+      if(!GetATRValue(1, atr))
+         continue;
+
+      double trailingDistance =
+         atr * TrailingATRMultiplier;
+
+      if(trailingDistance <= 0.0)
+         continue;
+
+      MqlTick tick;
+
+      if(!SymbolInfoTick(_Symbol, tick))
+         continue;
+
+      double minimumDistance =
+         GetMinimumStopDistancePrice();
+
+      double newSL = 0.0;
+
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         if(tick.bid <= 0.0)
+            continue;
+
+         newSL = NormalizePrice(
+            tick.bid - trailingDistance
+         );
+
+         // Respect broker minimum distance.
+         double maximumAllowedSL =
+            NormalizePrice(
+               tick.bid - minimumDistance
+            );
+
+         if(newSL > maximumAllowedSL)
+            newSL = maximumAllowedSL;
+
+         // Never widen the stop.
+         if(currentSL > 0.0 &&
+            newSL <= currentSL)
+         {
+            continue;
+         }
+
+         if(!IsValidStopLoss(
+            ORDER_TYPE_BUY,
+            tick.bid,
+            newSL))
+         {
+            continue;
+         }
+      }
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         if(tick.ask <= 0.0)
+            continue;
+
+         newSL = NormalizePrice(
+            tick.ask + trailingDistance
+         );
+
+         double minimumAllowedSL =
+            NormalizePrice(
+               tick.ask + minimumDistance
+            );
+
+         if(newSL < minimumAllowedSL)
+            newSL = minimumAllowedSL;
+
+         // Never widen the stop.
+         if(currentSL > 0.0 &&
+            newSL >= currentSL)
+         {
+            continue;
+         }
+
+         if(!IsValidStopLoss(
+            ORDER_TYPE_SELL,
+            tick.ask,
+            newSL))
+         {
+            continue;
+         }
+      }
+      else
+      {
+         continue;
+      }
+
+      ResetLastError();
+
+      bool modified = trade.PositionModify(
+         ticket,
+         newSL,
+         currentTP
+      );
+
+      if(!modified)
+      {
+         Print(
+            "Trailing stop modification failed. Ticket=",
+            ticket,
+            " Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription(),
+            " Error=",
+            GetLastError()
+         );
+      }
+   }
+}
+
+//==================================================
+// OPTIONAL CHANNEL EXIT
+//
+// Sensible exit mechanism:
+// BUY  -> close below the Donchian midpoint.
+// SELL -> close above the Donchian midpoint.
+//
+// The exit channel is calculated from historical
+// candles [2] onward and never uses the signal candle.
+//==================================================
+void ManageChannelExit()
+{
+   if(!HasOwnPosition())
+      return;
+
+   if(!HasEnoughBars())
+      return;
+
+   double upper = 0.0;
+   double lower = 0.0;
+
+   if(!GetDonchianLevels(
+      DonchianPeriod,
+      2,
+      upper,
+      lower))
+   {
+      return;
+   }
+
+   double midpoint = (upper + lower) / 2.0;
+
+   if(midpoint <= 0.0)
+      return;
+
+   double close1 = iClose(
+      _Symbol,
+      PERIOD_CURRENT,
+      1
+   );
+
+   if(close1 <= 0.0)
+      return;
+
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol ||
+         (ulong)magic != MagicNumber)
+      {
+         continue;
+      }
+
+      ENUM_POSITION_TYPE type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(
+            POSITION_TYPE
+         );
+
+      bool exitSignal = false;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         exitSignal = (close1 < midpoint);
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         exitSignal = (close1 > midpoint);
+      }
+
+      if(!exitSignal)
+         continue;
+
+      ResetLastError();
+
+      bool closed = trade.PositionClose(ticket);
+
+      if(!closed)
+      {
+         Print(
+            "Channel exit failed. Ticket=",
+            ticket,
+            " Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription(),
+            " Error=",
+            GetLastError()
+         );
+      }
+   }
+}
+
+//==================================================
+// CLOSE OWN POSITION
+//==================================================
+bool CloseOwnPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      ResetLastError();
+
+      bool result = trade.PositionClose(ticket);
+
+      if(!result)
+      {
+         Print(
+            "Position close failed. Ticket=",
+            ticket,
+            " Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription(),
+            " Error=",
+            GetLastError()
+         );
+
+         return(false);
+      }
+
+      return(true);
+   }
+
+   return(false);
+}

@@ -1,0 +1,1218 @@
+//+------------------------------------------------------------------+
+//|                                                EA-13 RSI Divergence.mq5
+//|                         Non-Repainting RSI Divergence Expert Advisor
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-13 - RSI Divergence"
+#property description "Non-repainting regular RSI divergence strategy"
+
+//--- Trading
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+
+//--- General
+input ulong  MagicNumber                    = 9013;   // Unique magic number
+input double LotSize                        = 0.10;   // Fixed lot size
+input int    MaxSpreadPoints                = 50;     // Maximum allowed spread
+
+//--- RSI
+input int    RSI_Period                     = 14;     // RSI period
+
+//--- Pivot Detection
+input int    PivotStrength                  = 2;      // Pivot confirmation strength
+input int    MinimumPivotDistance            = 3;      // Minimum bars between pivots
+input int    MaximumPivotDistance            = 50;     // Maximum bars between pivots
+
+//--- Divergence
+input double MinimumPriceDifferencePercent   = 0.05;   // Minimum price divergence %
+input double MinimumRSIDifference             = 2.0;    // Minimum RSI divergence
+input int    MaxSignalAgeBars                = 3;      // Maximum age of recent pivot
+
+//--- Risk Management
+input int    StopBufferPoints                = 50;     // SL buffer in points
+input int    MaxStopLossPoints               = 500;    // Maximum SL distance
+input double RiskRewardRatio                 = 1.50;   // Risk/reward ratio
+
+//--- Optional Exit
+input bool   UseRSIExit                      = false;  // Enable RSI exit
+input double UpperExitLevel                  = 70.0;   // BUY RSI exit level
+input double LowerExitLevel                  = 30.0;   // SELL RSI exit level
+
+//--- Optional Filter
+input bool   UseDivergenceStrengthFilter     = false;  // Enable strength filter
+input double MinimumDivergenceScore         = 0.0;    // Minimum divergence score
+
+//--- Trading Hours
+input bool   UseTradingHours                 = false;  // Restrict trading hours
+input int    StartHour                       = 0;      // Trading start hour
+input int    EndHour                         = 23;     // Trading end hour
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                 |
+//+------------------------------------------------------------------+
+
+int      rsiHandle = INVALID_HANDLE;
+datetime lastBarTime = 0;
+
+datetime consumedBullRecent = 0;
+datetime consumedBullPrevious = 0;
+
+datetime consumedBearRecent = 0;
+datetime consumedBearPrevious = 0;
+
+//+------------------------------------------------------------------+
+//| STRUCTURE                                                        |
+//+------------------------------------------------------------------+
+
+struct PivotInfo
+{
+   int      shift;
+   datetime time;
+   double   price;
+   double   rsi;
+};
+
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION                                            |
+//+------------------------------------------------------------------+
+
+int OnInit()
+{
+   if(RSI_Period < 2)
+   {
+      Print("Invalid RSI_Period.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(PivotStrength < 1)
+   {
+      Print("Invalid PivotStrength.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(MinimumPivotDistance < 1)
+   {
+      Print("Invalid MinimumPivotDistance.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(MaximumPivotDistance < MinimumPivotDistance)
+   {
+      Print("MaximumPivotDistance must be >= MinimumPivotDistance.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("RiskRewardRatio must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(LotSize <= 0.0)
+   {
+      Print("LotSize must be greater than zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+
+   if(rsiHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create RSI handle. Error: ", GetLastError());
+      return(INIT_FAILED);
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION                                          |
+//+------------------------------------------------------------------+
+
+void OnDeinit(const int reason)
+{
+   if(rsiHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(rsiHandle);
+      rsiHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT TICK                                                      |
+//+------------------------------------------------------------------+
+
+void OnTick()
+{
+   ManagePositions();
+
+   if(!IsNewBar())
+      return;
+
+   if(Bars(_Symbol, PERIOD_CURRENT) < 100)
+      return;
+
+   if(!IsTradingTime())
+      return;
+
+   if(HasOpenPosition())
+      return;
+
+   if(!IsSpreadAcceptable())
+      return;
+
+   PivotInfo recentLow;
+   PivotInfo previousLow;
+
+   PivotInfo recentHigh;
+   PivotInfo previousHigh;
+
+   bool bullish = DetectBullishDivergence(recentLow, previousLow);
+   bool bearish = DetectBearishDivergence(recentHigh, previousHigh);
+
+   //--- If both occur simultaneously, use the more recent pivot signal.
+   if(bullish && bearish)
+   {
+      if(recentLow.time > recentHigh.time)
+         bearish = false;
+      else
+         bullish = false;
+   }
+
+   if(bullish)
+   {
+      if(!IsDivergenceConsumed(true, recentLow.time, previousLow.time))
+      {
+         if(OpenBuy(recentLow.price))
+         {
+            consumedBullRecent   = recentLow.time;
+            consumedBullPrevious = previousLow.time;
+         }
+      }
+
+      return;
+   }
+
+   if(bearish)
+   {
+      if(!IsDivergenceConsumed(false, recentHigh.time, previousHigh.time))
+      {
+         if(OpenSell(recentHigh.price))
+         {
+            consumedBearRecent   = recentHigh.time;
+            consumedBearPrevious = previousHigh.time;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| NEW BAR DETECTION                                                |
+//+------------------------------------------------------------------+
+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime == 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| PIVOT LOW                                                        |
+//+------------------------------------------------------------------+
+
+bool IsPivotLow(const MqlRates &rates[], const int shift, const int strength)
+{
+   int total = ArraySize(rates);
+
+   if(shift <= strength)
+      return false;
+
+   if(shift + strength >= total)
+      return false;
+
+   double pivotLow = rates[shift].low;
+
+   for(int i = 1; i <= strength; i++)
+   {
+      //--- Newer candles
+      if(pivotLow >= rates[shift - i].low)
+         return false;
+
+      //--- Older candles
+      if(pivotLow >= rates[shift + i].low)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| PIVOT HIGH                                                       |
+//+------------------------------------------------------------------+
+
+bool IsPivotHigh(const MqlRates &rates[], const int shift, const int strength)
+{
+   int total = ArraySize(rates);
+
+   if(shift <= strength)
+      return false;
+
+   if(shift + strength >= total)
+      return false;
+
+   double pivotHigh = rates[shift].high;
+
+   for(int i = 1; i <= strength; i++)
+   {
+      //--- Newer candles
+      if(pivotHigh <= rates[shift - i].high)
+         return false;
+
+      //--- Older candles
+      if(pivotHigh <= rates[shift + i].high)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| GET RSI DATA                                                     |
+//+------------------------------------------------------------------+
+
+bool GetRSIData(const int count, double &rsi[])
+{
+   if(rsiHandle == INVALID_HANDLE)
+      return false;
+
+   if(count <= 0)
+      return false;
+
+   ArrayResize(rsi, count);
+   ArraySetAsSeries(rsi, true);
+
+   ResetLastError();
+
+   int copied = CopyBuffer(rsiHandle, 0, 0, count, rsi);
+
+   if(copied != count)
+   {
+      int errorCode = GetLastError();
+
+      if(errorCode != 0)
+         Print("CopyBuffer RSI failed. Error: ", errorCode);
+
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| FIND RECENT PIVOT LOW                                            |
+//+------------------------------------------------------------------+
+
+bool FindRecentPivotLow(PivotInfo &pivot)
+{
+   int barsAvailable = Bars(_Symbol, PERIOD_CURRENT);
+
+   if(barsAvailable < 50)
+      return false;
+
+   int requiredBars = MathMin(barsAvailable, 5000);
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int copiedRates = CopyRates(_Symbol, PERIOD_CURRENT, 0, requiredBars, rates);
+
+   if(copiedRates <= PivotStrength + 2)
+      return false;
+
+   double rsi[];
+   if(!GetRSIData(copiedRates, rsi))
+      return false;
+
+   int firstShift = PivotStrength + 1;
+   int lastShift  = MathMin(MaxSignalAgeBars, copiedRates - PivotStrength - 1);
+
+   if(lastShift < firstShift)
+      return false;
+
+   for(int shift = firstShift; shift <= lastShift; shift++)
+   {
+      if(!IsPivotLow(rates, shift, PivotStrength))
+         continue;
+
+      pivot.shift = shift;
+      pivot.time  = rates[shift].time;
+      pivot.price = rates[shift].low;
+      pivot.rsi   = rsi[shift];
+
+      if(pivot.rsi < 0.0 || pivot.rsi > 100.0)
+         continue;
+
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| FIND PREVIOUS PIVOT LOW                                          |
+//+------------------------------------------------------------------+
+
+bool FindPreviousPivotLow(const PivotInfo &recent, PivotInfo &previous)
+{
+   int barsAvailable = Bars(_Symbol, PERIOD_CURRENT);
+
+   if(barsAvailable < 50)
+      return false;
+
+   int requiredBars = MathMin(barsAvailable, 5000);
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int copiedRates = CopyRates(_Symbol, PERIOD_CURRENT, 0, requiredBars, rates);
+
+   if(copiedRates <= recent.shift + PivotStrength + 1)
+      return false;
+
+   double rsi[];
+   if(!GetRSIData(copiedRates, rsi))
+      return false;
+
+   int firstShift = recent.shift + MinimumPivotDistance;
+   int lastShift  = recent.shift + MaximumPivotDistance;
+
+   lastShift = MathMin(lastShift, copiedRates - PivotStrength - 1);
+
+   if(firstShift > lastShift)
+      return false;
+
+   for(int shift = firstShift; shift <= lastShift; shift++)
+   {
+      if(!IsPivotLow(rates, shift, PivotStrength))
+         continue;
+
+      previous.shift = shift;
+      previous.time  = rates[shift].time;
+      previous.price = rates[shift].low;
+      previous.rsi   = rsi[shift];
+
+      if(previous.rsi < 0.0 || previous.rsi > 100.0)
+         continue;
+
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| FIND RECENT PIVOT HIGH                                           |
+//+------------------------------------------------------------------+
+
+bool FindRecentPivotHigh(PivotInfo &pivot)
+{
+   int barsAvailable = Bars(_Symbol, PERIOD_CURRENT);
+
+   if(barsAvailable < 50)
+      return false;
+
+   int requiredBars = MathMin(barsAvailable, 5000);
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int copiedRates = CopyRates(_Symbol, PERIOD_CURRENT, 0, requiredBars, rates);
+
+   if(copiedRates <= PivotStrength + 2)
+      return false;
+
+   double rsi[];
+   if(!GetRSIData(copiedRates, rsi))
+      return false;
+
+   int firstShift = PivotStrength + 1;
+   int lastShift  = MathMin(MaxSignalAgeBars, copiedRates - PivotStrength - 1);
+
+   if(lastShift < firstShift)
+      return false;
+
+   for(int shift = firstShift; shift <= lastShift; shift++)
+   {
+      if(!IsPivotHigh(rates, shift, PivotStrength))
+         continue;
+
+      pivot.shift = shift;
+      pivot.time  = rates[shift].time;
+      pivot.price = rates[shift].high;
+      pivot.rsi   = rsi[shift];
+
+      if(pivot.rsi < 0.0 || pivot.rsi > 100.0)
+         continue;
+
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| FIND PREVIOUS PIVOT HIGH                                         |
+//+------------------------------------------------------------------+
+
+bool FindPreviousPivotHigh(const PivotInfo &recent, PivotInfo &previous)
+{
+   int barsAvailable = Bars(_Symbol, PERIOD_CURRENT);
+
+   if(barsAvailable < 50)
+      return false;
+
+   int requiredBars = MathMin(barsAvailable, 5000);
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int copiedRates = CopyRates(_Symbol, PERIOD_CURRENT, 0, requiredBars, rates);
+
+   if(copiedRates <= recent.shift + PivotStrength + 1)
+      return false;
+
+   double rsi[];
+   if(!GetRSIData(copiedRates, rsi))
+      return false;
+
+   int firstShift = recent.shift + MinimumPivotDistance;
+   int lastShift  = recent.shift + MaximumPivotDistance;
+
+   lastShift = MathMin(lastShift, copiedRates - PivotStrength - 1);
+
+   if(firstShift > lastShift)
+      return false;
+
+   for(int shift = firstShift; shift <= lastShift; shift++)
+   {
+      if(!IsPivotHigh(rates, shift, PivotStrength))
+         continue;
+
+      previous.shift = shift;
+      previous.time  = rates[shift].time;
+      previous.price = rates[shift].high;
+      previous.rsi   = rsi[shift];
+
+      if(previous.rsi < 0.0 || previous.rsi > 100.0)
+         continue;
+
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| BULLISH DIVERGENCE                                               |
+//+------------------------------------------------------------------+
+
+bool DetectBullishDivergence(PivotInfo &recent, PivotInfo &previous)
+{
+   if(!FindRecentPivotLow(recent))
+      return false;
+
+   if(!FindPreviousPivotLow(recent, previous))
+      return false;
+
+   if(recent.shift >= previous.shift)
+      return false;
+
+   //--- Price must make a lower low.
+   if(recent.price >= previous.price)
+      return false;
+
+   //--- RSI must make a higher low.
+   if(recent.rsi <= previous.rsi)
+      return false;
+
+   //--- Price divergence percentage.
+   if(previous.price <= 0.0)
+      return false;
+
+   double priceDifferencePercent =
+      ((previous.price - recent.price) / previous.price) * 100.0;
+
+   if(priceDifferencePercent < MinimumPriceDifferencePercent)
+      return false;
+
+   //--- RSI divergence.
+   double rsiDifference = recent.rsi - previous.rsi;
+
+   if(rsiDifference < MinimumRSIDifference)
+      return false;
+
+   if(UseDivergenceStrengthFilter)
+   {
+      double score = CalculateBullishScore(
+         previous.price,
+         recent.price,
+         previous.rsi,
+         recent.rsi
+      );
+
+      if(score < MinimumDivergenceScore)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| BEARISH DIVERGENCE                                               |
+//+------------------------------------------------------------------+
+
+bool DetectBearishDivergence(PivotInfo &recent, PivotInfo &previous)
+{
+   if(!FindRecentPivotHigh(recent))
+      return false;
+
+   if(!FindPreviousPivotHigh(recent, previous))
+      return false;
+
+   if(recent.shift >= previous.shift)
+      return false;
+
+   //--- Price must make a higher high.
+   if(recent.price <= previous.price)
+      return false;
+
+   //--- RSI must make a lower high.
+   if(recent.rsi >= previous.rsi)
+      return false;
+
+   //--- Price divergence percentage.
+   if(previous.price <= 0.0)
+      return false;
+
+   double priceDifferencePercent =
+      ((recent.price - previous.price) / previous.price) * 100.0;
+
+   if(priceDifferencePercent < MinimumPriceDifferencePercent)
+      return false;
+
+   //--- RSI divergence.
+   double rsiDifference = previous.rsi - recent.rsi;
+
+   if(rsiDifference < MinimumRSIDifference)
+      return false;
+
+   if(UseDivergenceStrengthFilter)
+   {
+      double score = CalculateBearishScore(
+         previous.price,
+         recent.price,
+         previous.rsi,
+         recent.rsi
+      );
+
+      if(score < MinimumDivergenceScore)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| BULLISH DIVERGENCE SCORE                                         |
+//+------------------------------------------------------------------+
+
+double CalculateBullishScore(
+   const double previousPrice,
+   const double recentPrice,
+   const double previousRSI,
+   const double recentRSI)
+{
+   if(previousPrice <= 0.0)
+      return 0.0;
+
+   double priceScore =
+      ((previousPrice - recentPrice) / previousPrice) * 100.0;
+
+   double rsiScore = recentRSI - previousRSI;
+
+   return priceScore + rsiScore;
+}
+
+//+------------------------------------------------------------------+
+//| BEARISH DIVERGENCE SCORE                                         |
+//+------------------------------------------------------------------+
+
+double CalculateBearishScore(
+   const double previousPrice,
+   const double recentPrice,
+   const double previousRSI,
+   const double recentRSI)
+{
+   if(previousPrice <= 0.0)
+      return 0.0;
+
+   double priceScore =
+      ((recentPrice - previousPrice) / previousPrice) * 100.0;
+
+   double rsiScore = previousRSI - recentRSI;
+
+   return priceScore + rsiScore;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK CONSUMED DIVERGENCE                                        |
+//+------------------------------------------------------------------+
+
+bool IsDivergenceConsumed(
+   const bool bullish,
+   const datetime recentTime,
+   const datetime previousTime)
+{
+   if(bullish)
+   {
+      if(consumedBullRecent == recentTime &&
+         consumedBullPrevious == previousTime)
+      {
+         return true;
+      }
+   }
+   else
+   {
+      if(consumedBearRecent == recentTime &&
+         consumedBearPrevious == previousTime)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN BUY                                                         |
+//+------------------------------------------------------------------+
+
+bool OpenBuy(const double recentPivotLow)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double entryPrice = tick.ask;
+
+   double sl = CalculateStopLoss(true, entryPrice, recentPivotLow);
+
+   if(sl <= 0.0)
+      return false;
+
+   double risk = entryPrice - sl;
+
+   if(risk <= 0.0)
+      return false;
+
+   double maxRisk = MaxStopLossPoints * _Point;
+
+   if(risk > maxRisk)
+      return false;
+
+   double tp = CalculateTakeProfit(true, entryPrice, sl);
+
+   if(tp <= entryPrice)
+      return false;
+
+   sl = NormalizePrice(sl);
+   tp = NormalizePrice(tp);
+
+   if(!AreStopsValid(true, entryPrice, sl, tp))
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+      return false;
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "EA-13 RSI Bullish Divergence"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN SELL                                                        |
+//+------------------------------------------------------------------+
+
+bool OpenSell(const double recentPivotHigh)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double entryPrice = tick.bid;
+
+   double sl = CalculateStopLoss(false, entryPrice, recentPivotHigh);
+
+   if(sl <= 0.0)
+      return false;
+
+   double risk = sl - entryPrice;
+
+   if(risk <= 0.0)
+      return false;
+
+   double maxRisk = MaxStopLossPoints * _Point;
+
+   if(risk > maxRisk)
+      return false;
+
+   double tp = CalculateTakeProfit(false, entryPrice, sl);
+
+   if(tp >= entryPrice)
+      return false;
+
+   sl = NormalizePrice(sl);
+   tp = NormalizePrice(tp);
+
+   if(!AreStopsValid(false, entryPrice, sl, tp))
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+      return false;
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "EA-13 RSI Bearish Divergence"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE STOP LOSS                                              |
+//+------------------------------------------------------------------+
+
+double CalculateStopLoss(
+   const bool isBuy,
+   const double entryPrice,
+   const double pivotPrice)
+{
+   double buffer = StopBufferPoints * _Point;
+
+   double sl;
+
+   if(isBuy)
+      sl = pivotPrice - buffer;
+   else
+      sl = pivotPrice + buffer;
+
+   //--- Respect broker stop level.
+   long stopsLevel = 0;
+
+   if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL, stopsLevel))
+   {
+      double minimumDistance = (double)stopsLevel * _Point;
+
+      if(isBuy)
+      {
+         double minimumSL = entryPrice - minimumDistance;
+
+         if(sl > minimumSL)
+            sl = minimumSL;
+      }
+      else
+      {
+         double minimumSL = entryPrice + minimumDistance;
+
+         if(sl < minimumSL)
+            sl = minimumSL;
+      }
+   }
+
+   return NormalizePrice(sl);
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE TAKE PROFIT                                            |
+//+------------------------------------------------------------------+
+
+double CalculateTakeProfit(
+   const bool isBuy,
+   const double entryPrice,
+   const double sl)
+{
+   double risk;
+
+   if(isBuy)
+      risk = entryPrice - sl;
+   else
+      risk = sl - entryPrice;
+
+   if(risk <= 0.0)
+      return 0.0;
+
+   double tp;
+
+   if(isBuy)
+      tp = entryPrice + risk * RiskRewardRatio;
+   else
+      tp = entryPrice - risk * RiskRewardRatio;
+
+   return NormalizePrice(tp);
+}
+
+//+------------------------------------------------------------------+
+//| VALIDATE STOPS                                                   |
+//+------------------------------------------------------------------+
+
+bool AreStopsValid(
+   const bool isBuy,
+   const double entryPrice,
+   const double sl,
+   const double tp)
+{
+   if(sl <= 0.0 || tp <= 0.0)
+      return false;
+
+   long stopsLevel = 0;
+
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL, stopsLevel))
+      return false;
+
+   double minimumDistance = (double)stopsLevel * _Point;
+
+   if(isBuy)
+   {
+      if(sl >= entryPrice)
+         return false;
+
+      if(tp <= entryPrice)
+         return false;
+
+      if((entryPrice - sl) < minimumDistance)
+         return false;
+
+      if((tp - entryPrice) < minimumDistance)
+         return false;
+   }
+   else
+   {
+      if(sl <= entryPrice)
+         return false;
+
+      if(tp >= entryPrice)
+         return false;
+
+      if((sl - entryPrice) < minimumDistance)
+         return false;
+
+      if((entryPrice - tp) < minimumDistance)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE LOT SIZE                                               |
+//+------------------------------------------------------------------+
+
+double CalculateLotSize()
+{
+   double minimumLot = 0.0;
+   double maximumLot = 0.0;
+   double volumeStep = 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN, minimumLot))
+      return 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX, maximumLot))
+      return 0.0;
+
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP, volumeStep))
+      return 0.0;
+
+   if(volumeStep <= 0.0)
+      return 0.0;
+
+   double volume = LotSize;
+
+   if(volume < minimumLot)
+      volume = minimumLot;
+
+   if(volume > maximumLot)
+      volume = maximumLot;
+
+   volume = MathFloor(volume / volumeStep + 0.0000001) * volumeStep;
+
+   if(volume < minimumLot)
+      volume = minimumLot;
+
+   if(volume > maximumLot)
+      volume = maximumLot;
+
+   return NormalizeVolume(volume, volumeStep);
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE VOLUME                                                 |
+//+------------------------------------------------------------------+
+
+double NormalizeVolume(
+   const double volume,
+   const double step)
+{
+   if(step <= 0.0)
+      return volume;
+
+   int digits = 0;
+   double testStep = step;
+
+   while(digits < 8 && MathAbs(testStep - MathRound(testStep)) > 0.00000001)
+   {
+      testStep *= 10.0;
+      digits++;
+   }
+
+   return NormalizeDouble(volume, digits);
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE PRICE                                                  |
+//+------------------------------------------------------------------+
+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, (int)_Digits);
+}
+
+//+------------------------------------------------------------------+
+//| CHECK OPEN POSITION                                              |
+//+------------------------------------------------------------------+
+
+bool HasOpenPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         magic == (long)MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| SPREAD FILTER                                                    |
+//+------------------------------------------------------------------+
+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaxSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| TRADING HOURS                                                    |
+//+------------------------------------------------------------------+
+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   if(StartHour == EndHour)
+      return true;
+
+   if(StartHour < EndHour)
+   {
+      if(hour >= StartHour && hour < EndHour)
+         return true;
+
+      return false;
+   }
+
+   //--- Overnight trading window.
+   if(hour >= StartHour || hour < EndHour)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| POSITION MANAGEMENT                                              |
+//+------------------------------------------------------------------+
+
+void ManagePositions()
+{
+   if(!UseRSIExit)
+      return;
+
+   if(rsiHandle == INVALID_HANDLE)
+      return;
+
+   if(!HasOpenPosition())
+      return;
+
+   double rsi[];
+   ArrayResize(rsi, 3);
+   ArraySetAsSeries(rsi, true);
+
+   int copied = CopyBuffer(rsiHandle, 0, 0, 3, rsi);
+
+   if(copied < 2)
+      return;
+
+   double closedRSI = rsi[1];
+
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol ||
+         magic != (long)MagicNumber)
+      {
+         continue;
+      }
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         if(closedRSI >= UpperExitLevel)
+         {
+            if(!trade.PositionClose(ticket))
+            {
+               Print(
+                  "Failed to close BUY by RSI exit. Retcode=",
+                  trade.ResultRetcode(),
+                  " Description=",
+                  trade.ResultRetcodeDescription()
+               );
+            }
+         }
+      }
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         if(closedRSI <= LowerExitLevel)
+         {
+            if(!trade.PositionClose(ticket))
+            {
+               Print(
+                  "Failed to close SELL by RSI exit. Retcode=",
+                  trade.ResultRetcode(),
+                  " Description=",
+                  trade.ResultRetcodeDescription()
+               );
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+

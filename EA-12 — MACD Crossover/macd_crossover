@@ -1,0 +1,648 @@
+#property strict
+#property version   "1.00"
+#property description "EA-12 - MACD Crossover"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- General
+input ulong  MagicNumber              = 9012;
+input double LotSize                  = 0.10;
+input int    MaxSpreadPoints          = 50;
+
+//--- MACD
+input int    FastPeriod               = 12;
+input int    SlowPeriod               = 26;
+input int    SignalPeriod             = 9;
+
+//--- Optional MACD Filters
+input bool   UseZeroLineFilter        = false;
+input bool   UseHistogramFilter       = false;
+input double MinimumHistogramPoints   = 0.0;
+
+//--- Risk Management
+input double StopLossPercent          = 0.50;
+input double RiskRewardRatio          = 1.50;
+
+//--- Optional Exit
+input bool   UseOppositeCrossExit     = false;
+
+//--- Trading Hours
+input bool   UseTradingHours          = false;
+input int    StartHour                = 0;
+input int    EndHour                  = 23;
+
+//--- Global variables
+int      macdHandle = INVALID_HANDLE;
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(FastPeriod <= 0 || SlowPeriod <= 0 || SignalPeriod <= 0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(FastPeriod >= SlowPeriod)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(LotSize <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(StopLossPercent <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(RiskRewardRatio <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MaxSpreadPoints < 0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(StartHour < 0 || StartHour > 23 ||
+      EndHour < 0 || EndHour > 23)
+      return INIT_PARAMETERS_INCORRECT;
+
+   macdHandle = iMACD(
+      _Symbol,
+      PERIOD_CURRENT,
+      FastPeriod,
+      SlowPeriod,
+      SignalPeriod,
+      PRICE_CLOSE
+   );
+
+   if(macdHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create MACD handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(macdHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(macdHandle);
+      macdHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(macdHandle == INVALID_HANDLE)
+      return;
+
+   if(!IsNewBar())
+      return;
+
+   ManagePositions();
+
+   double macdMain[3];
+   double macdSignal[3];
+
+   if(!GetMACDValues(macdMain, macdSignal))
+      return;
+
+   bool bullishCross =
+      (macdMain[2] <= macdSignal[2] &&
+       macdMain[1] > macdSignal[1]);
+
+   bool bearishCross =
+      (macdMain[2] >= macdSignal[2] &&
+       macdMain[1] < macdSignal[1]);
+
+   //--- Optional opposite crossover exit
+   if(UseOppositeCrossExit)
+   {
+      CheckOppositeCrossExit(bullishCross, bearishCross);
+   }
+
+   //--- Only one position per symbol + magic number
+   if(HasOpenPosition())
+      return;
+
+   //--- Trading hours
+   if(!IsTradingTime())
+      return;
+
+   //--- Spread filter
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- BUY
+   if(bullishCross)
+   {
+      if(UseZeroLineFilter && macdMain[1] <= 0.0)
+         return;
+
+      if(UseHistogramFilter)
+      {
+         double histogramPoints =
+            (macdMain[1] - macdSignal[1]) / _Point;
+
+         if(histogramPoints < MinimumHistogramPoints)
+            return;
+      }
+
+      OpenBuy();
+      return;
+   }
+
+   //--- SELL
+   if(bearishCross)
+   {
+      if(UseZeroLineFilter && macdMain[1] >= 0.0)
+         return;
+
+      if(UseHistogramFilter)
+      {
+         double histogramPoints =
+            (macdSignal[1] - macdMain[1]) / _Point;
+
+         if(histogramPoints < MinimumHistogramPoints)
+            return;
+      }
+
+      OpenSell();
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect a newly opened candle                                     |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get MACD values                                                  |
+//| Array indexes after CopyBuffer:                                  |
+//| [0] = bar 0, [1] = bar 1, [2] = bar 2                          |
+//+------------------------------------------------------------------+
+bool GetMACDValues(double &mainBuffer[], double &signalBuffer[])
+{
+   if(macdHandle == INVALID_HANDLE)
+      return false;
+
+   ArraySetAsSeries(mainBuffer, true);
+   ArraySetAsSeries(signalBuffer, true);
+
+   int copiedMain =
+      CopyBuffer(macdHandle, 0, 0, 3, mainBuffer);
+
+   int copiedSignal =
+      CopyBuffer(macdHandle, 1, 0, 3, signalBuffer);
+
+   if(copiedMain != 3 || copiedSignal != 3)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA already has a position                    |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         (ulong)magic == MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check spread                                                     |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   if(MaxSpreadPoints <= 0)
+      return true;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double spreadPoints =
+      (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaxSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| Check trading hours                                              |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   int hour = dt.hour;
+
+   //--- Same hour range
+   if(StartHour == EndHour)
+      return true;
+
+   //--- Normal range, e.g. 08 -> 18
+   if(StartHour < EndHour)
+   {
+      return (hour >= StartHour && hour < EndHour);
+   }
+
+   //--- Overnight range, e.g. 22 -> 06
+   return (hour >= StartHour || hour < EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate valid lot size                                         |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+   double minVolume  = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MIN
+   );
+
+   double maxVolume  = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MAX
+   );
+
+   double stepVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_STEP
+   );
+
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      stepVolume <= 0.0)
+   {
+      return 0.0;
+   }
+
+   double volume = LotSize;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   if(volume > maxVolume)
+      volume = maxVolume;
+
+   volume =
+      MathFloor((volume - minVolume) / stepVolume + 0.5)
+      * stepVolume + minVolume;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   if(volume > maxVolume)
+      volume = maxVolume;
+
+   int volumeDigits = 0;
+   double tempStep = stepVolume;
+
+   while(volumeDigits < 8 &&
+         MathAbs(tempStep - MathRound(tempStep)) > 0.00000001)
+   {
+      tempStep *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate minimum stop distance                                  |
+//+------------------------------------------------------------------+
+double GetMinimumStopDistance()
+{
+   long stopsLevel =
+      SymbolInfoInteger(
+         _Symbol,
+         SYMBOL_TRADE_STOPS_LEVEL
+      );
+
+   if(stopsLevel < 0)
+      stopsLevel = 0;
+
+   return (double)stopsLevel * _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+bool OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double entryPrice = tick.ask;
+
+   if(entryPrice <= 0.0)
+      return false;
+
+   double stopDistance =
+      entryPrice * StopLossPercent / 100.0;
+
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   //--- Ensure SL satisfies broker minimum distance
+   if(stopDistance < minimumStopDistance)
+      stopDistance = minimumStopDistance;
+
+   if(stopDistance <= 0.0)
+      return false;
+
+   double sl =
+      entryPrice - stopDistance;
+
+   double risk =
+      entryPrice - sl;
+
+   double tp =
+      entryPrice + risk * RiskRewardRatio;
+
+   //--- Normalize
+   entryPrice = NormalizePrice(entryPrice);
+   sl         = NormalizePrice(sl);
+   tp         = NormalizePrice(tp);
+
+   //--- Final validity checks
+   if(sl >= entryPrice)
+      return false;
+
+   if(tp <= entryPrice)
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+      return false;
+
+   ResetLastError();
+
+   bool result =
+      trade.Buy(
+         volume,
+         _Symbol,
+         entryPrice,
+         sl,
+         tp,
+         "EA-12 MACD Buy"
+      );
+
+   if(!result)
+   {
+      Print(
+         "BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+bool OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double entryPrice = tick.bid;
+
+   if(entryPrice <= 0.0)
+      return false;
+
+   double stopDistance =
+      entryPrice * StopLossPercent / 100.0;
+
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   //--- Ensure SL satisfies broker minimum distance
+   if(stopDistance < minimumStopDistance)
+      stopDistance = minimumStopDistance;
+
+   if(stopDistance <= 0.0)
+      return false;
+
+   double sl =
+      entryPrice + stopDistance;
+
+   double risk =
+      sl - entryPrice;
+
+   double tp =
+      entryPrice - risk * RiskRewardRatio;
+
+   //--- Normalize
+   entryPrice = NormalizePrice(entryPrice);
+   sl         = NormalizePrice(sl);
+   tp         = NormalizePrice(tp);
+
+   //--- Final validity checks
+   if(sl <= entryPrice)
+      return false;
+
+   if(tp >= entryPrice)
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+      return false;
+
+   ResetLastError();
+
+   bool result =
+      trade.Sell(
+         volume,
+         _Symbol,
+         entryPrice,
+         sl,
+         tp,
+         "EA-12 MACD Sell"
+      );
+
+   if(!result)
+   {
+      Print(
+         "SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing EA positions                                    |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   if(!UseOppositeCrossExit)
+      return;
+
+   double macdMain[3];
+   double macdSignal[3];
+
+   if(!GetMACDValues(macdMain, macdSignal))
+      return;
+
+   bool bullishCross =
+      (macdMain[2] <= macdSignal[2] &&
+       macdMain[1] > macdSignal[1]);
+
+   bool bearishCross =
+      (macdMain[2] >= macdSignal[2] &&
+       macdMain[1] < macdSignal[1]);
+
+   CheckOppositeCrossExit(
+      bullishCross,
+      bearishCross
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Close position on opposite MACD crossover                       |
+//+------------------------------------------------------------------+
+void CheckOppositeCrossExit(
+   const bool bullishCross,
+   const bool bearishCross
+)
+{
+   if(!UseOppositeCrossExit)
+      return;
+
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol =
+         PositionGetString(POSITION_SYMBOL);
+
+      long magic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol ||
+         (ulong)magic != MagicNumber)
+      {
+         continue;
+      }
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)
+         PositionGetInteger(POSITION_TYPE);
+
+      bool shouldClose = false;
+
+      if(positionType == POSITION_TYPE_BUY &&
+         bearishCross)
+      {
+         shouldClose = true;
+      }
+
+      if(positionType == POSITION_TYPE_SELL &&
+         bullishCross)
+      {
+         shouldClose = true;
+      }
+
+      if(!shouldClose)
+         continue;
+
+      ResetLastError();
+
+      if(!trade.PositionClose(ticket))
+      {
+         Print(
+            "Position close failed. Ticket=",
+            ticket,
+            " Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription()
+         );
+      }
+   }
+}
+//+------------------------------------------------------------------+

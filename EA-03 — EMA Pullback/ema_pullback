@@ -1,0 +1,524 @@
+//+------------------------------------------------------------------+
+//|                                             EMA_Pullback_EA.mq5  |
+//|                         Simple EMA Pullback Strategy for MT5      |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EMA Pullback EA using closed-candle signals and ATR-based risk management."
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- Optimization inputs
+input int      FastEMAPeriod      = 9;       // Fast EMA Period
+input int      SlowEMAPeriod      = 21;      // Slow EMA Period
+input int      ATRPeriod          = 14;      // ATR Period
+input double   ATRSLMultiplier    = 1.5;     // ATR Stop Loss Multiplier
+input double   RiskRewardRatio    = 2.0;     // Risk:Reward Ratio
+input double   FixedLotSize       = 0.01;    // Fixed Lot Size
+input double   MaximumSpread      = 30.0;    // Maximum Spread (points)
+input ulong    MagicNumber        = 26091301;// Magic Number
+
+//--- Indicator handles
+int fastEMAHandle = INVALID_HANDLE;
+int slowEMAHandle = INVALID_HANDLE;
+int atrHandle     = INVALID_HANDLE;
+
+//--- Used to detect a new candle
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate inputs
+   if(FastEMAPeriod < 1)
+   {
+      Print("Error: Fast EMA Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(SlowEMAPeriod < 1)
+   {
+      Print("Error: Slow EMA Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(FastEMAPeriod >= SlowEMAPeriod)
+   {
+      Print("Error: Fast EMA Period must be smaller than Slow EMA Period.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATRPeriod < 1)
+   {
+      Print("Error: ATR Period must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATRSLMultiplier <= 0.0)
+   {
+      Print("Error: ATR SL Multiplier must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("Error: Risk:Reward Ratio must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(FixedLotSize <= 0.0)
+   {
+      Print("Error: Fixed Lot Size must be greater than 0.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MaximumSpread < 0.0)
+   {
+      Print("Error: Maximum Spread cannot be negative.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create EMA handles
+   fastEMAHandle = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      FastEMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   slowEMAHandle = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      SlowEMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATRPeriod
+   );
+
+   //--- Check handles
+   if(fastEMAHandle == INVALID_HANDLE)
+   {
+      Print("Error creating Fast EMA handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   if(slowEMAHandle == INVALID_HANDLE)
+   {
+      Print("Error creating Slow EMA handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("Error creating ATR handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Configure CTrade
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- Initialize current bar
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(fastEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(fastEMAHandle);
+      fastEMAHandle = INVALID_HANDLE;
+   }
+
+   if(slowEMAHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(slowEMAHandle);
+      slowEMAHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Execute strategy only once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Only one position belonging to this EA on this symbol
+   if(HasOpenPosition())
+      return;
+
+   //--- Check spread
+   if(!SpreadIsAcceptable())
+      return;
+
+   //--- Make sure enough indicator data is available
+   if(BarsCalculated(fastEMAHandle) < SlowEMAPeriod + 5)
+      return;
+
+   if(BarsCalculated(slowEMAHandle) < SlowEMAPeriod + 5)
+      return;
+
+   if(BarsCalculated(atrHandle) < ATRPeriod + 5)
+      return;
+
+   //--- Arrays for indicator values
+   double fastEMA[1];
+   double slowEMA[1];
+   double atrValue[1];
+
+   //--- Copy values from CLOSED candle (bar 1)
+   if(CopyBuffer(fastEMAHandle, 0, 1, 1, fastEMA) != 1)
+   {
+      Print("Failed to copy Fast EMA. Error: ", GetLastError());
+      return;
+   }
+
+   if(CopyBuffer(slowEMAHandle, 0, 1, 1, slowEMA) != 1)
+   {
+      Print("Failed to copy Slow EMA. Error: ", GetLastError());
+      return;
+   }
+
+   if(CopyBuffer(atrHandle, 0, 1, 1, atrValue) != 1)
+   {
+      Print("Failed to copy ATR. Error: ", GetLastError());
+      return;
+   }
+
+   //--- Get CLOSED candle OHLC
+   double openPrice  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double highPrice  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double lowPrice   = iLow(_Symbol, PERIOD_CURRENT, 1);
+
+   //--- Validate data
+   if(openPrice <= 0.0 ||
+      closePrice <= 0.0 ||
+      highPrice <= 0.0 ||
+      lowPrice <= 0.0 ||
+      atrValue[0] <= 0.0)
+   {
+      return;
+   }
+
+   //--- BUY condition
+   // Fast EMA above Slow EMA
+   // Candle low touches/crosses Fast EMA
+   // Candle closes bullish
+   bool buySignal =
+      (fastEMA[0] > slowEMA[0]) &&
+      (lowPrice <= fastEMA[0]) &&
+      (closePrice > openPrice);
+
+   //--- SELL condition
+   // Fast EMA below Slow EMA
+   // Candle high touches/crosses Fast EMA
+   // Candle closes bearish
+   bool sellSignal =
+      (fastEMA[0] < slowEMA[0]) &&
+      (highPrice >= fastEMA[0]) &&
+      (closePrice < openPrice);
+
+   //--- Calculate ATR stop distance
+   double stopDistance = atrValue[0] * ATRSLMultiplier;
+
+   if(stopDistance <= 0.0)
+      return;
+
+   //--- Open BUY
+   if(buySignal)
+   {
+      OpenBuy(stopDistance);
+      return;
+   }
+
+   //--- Open SELL
+   if(sellSignal)
+   {
+      OpenSell(stopDistance);
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect new candle                                                |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position on this symbol       |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         (ulong)magic == MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check maximum spread                                             |
+//+------------------------------------------------------------------+
+bool SpreadIsAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= MaximumSpread);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(minLot <= 0.0 || maxLot <= 0.0 || lotStep <= 0.0)
+      return 0.0;
+
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   if(lot < minLot)
+      lot = minLot;
+
+   int volumeDigits = 0;
+   double step = lotStep;
+
+   while(step < 1.0 && volumeDigits < 8)
+   {
+      step *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(lot, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy(double stopDistance)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Failed to get market tick for BUY.");
+      return;
+   }
+
+   double lot = NormalizeLot(FixedLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("Invalid BUY lot size.");
+      return;
+   }
+
+   //--- BUY entry price
+   double entryPrice = tick.ask;
+
+   //--- ATR-based SL
+   double stopLoss = entryPrice - stopDistance;
+
+   //--- TP based on Risk:Reward
+   double takeProfit =
+      entryPrice + (stopDistance * RiskRewardRatio);
+
+   //--- Respect broker minimum stop distance
+   int stopsLevel = (int)SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance = stopsLevel * _Point;
+
+   if(minimumDistance > 0.0)
+   {
+      if((entryPrice - stopLoss) < minimumDistance)
+         stopLoss = entryPrice - minimumDistance;
+
+      if((takeProfit - entryPrice) < minimumDistance)
+         takeProfit = entryPrice + minimumDistance;
+   }
+
+   //--- Normalize prices
+   stopLoss   = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Send BUY order
+   if(!trade.Buy(
+      lot,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EMA Pullback BUY"
+   ))
+   {
+      Print(
+         "BUY order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription()
+      );
+      return;
+   }
+
+   Print(
+      "BUY opened. Lot: ",
+      lot,
+      " SL: ",
+      stopLoss,
+      " TP: ",
+      takeProfit
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell(double stopDistance)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Failed to get market tick for SELL.");
+      return;
+   }
+
+   double lot = NormalizeLot(FixedLotSize);
+
+   if(lot <= 0.0)
+   {
+      Print("Invalid SELL lot size.");
+      return;
+   }
+
+   //--- SELL entry price
+   double entryPrice = tick.bid;
+
+   //--- ATR-based SL
+   double stopLoss = entryPrice + stopDistance;
+
+   //--- TP based on Risk:Reward
+   double takeProfit =
+      entryPrice - (stopDistance * RiskRewardRatio);
+
+   //--- Respect broker minimum stop distance
+   int stopsLevel = (int)SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance = stopsLevel * _Point;
+
+   if(minimumDistance > 0.0)
+   {
+      if((stopLoss - entryPrice) < minimumDistance)
+         stopLoss = entryPrice + minimumDistance;
+
+      if((entryPrice - takeProfit) < minimumDistance)
+         takeProfit = entryPrice - minimumDistance;
+   }
+
+   //--- Normalize prices
+   stopLoss   = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Send SELL order
+   if(!trade.Sell(
+      lot,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EMA Pullback SELL"
+   ))
+   {
+      Print(
+         "SELL order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription()
+      );
+      return;
+   }
+
+   Print(
+      "SELL opened. Lot: ",
+      lot,
+      " SL: ",
+      stopLoss,
+      " TP: ",
+      takeProfit
+   );
+}
+//+------------------------------------------------------------------+

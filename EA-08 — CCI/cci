@@ -1,0 +1,579 @@
+//+------------------------------------------------------------------+
+//| EA-08 — CCI Mean Reversion ATR                                   |
+//| MetaTrader 5                                                     |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "CCI Mean Reversion with ATR risk management"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- Inputs
+input int    CCI_Period          = 20;
+input double CCI_Buy_Level       = -100.0;
+input double CCI_Sell_Level      = 100.0;
+input int    ATR_Period          = 14;
+input double ATR_SL_Multiplier   = 1.5;
+input double RiskRewardRatio     = 1.2;
+input int    MaxHoldingBars      = 8;
+input double FixedLotSize        = 0.01;
+input int    MaximumSpread       = 30;
+input long   MagicNumber         = 2026091308;
+
+//--- Indicator handles
+int cciHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
+
+//--- New bar tracking
+datetime lastBarTime = 0;
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Create CCI handle
+   cciHandle = iCCI(
+      _Symbol,
+      PERIOD_CURRENT,
+      CCI_Period,
+      PRICE_TYPICAL
+   );
+
+   if(cciHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create CCI handle. Error = ",
+            GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATR_Period
+   );
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR handle. Error = ",
+            GetLastError());
+
+      IndicatorRelease(cciHandle);
+      cciHandle = INVALID_HANDLE;
+
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetDeviationInPoints(20);
+
+   //--- Initialize bar time
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(cciHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(cciHandle);
+      cciHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return;
+
+   //--- Only process once per new candle
+   if(currentBarTime == lastBarTime)
+      return;
+
+   lastBarTime = currentBarTime;
+
+   //--- Manage existing position first
+   ManageExistingPosition();
+
+   //--- Do not open another position if our position still exists
+   if(HasOurPosition())
+      return;
+
+   //--- Spread filter applies only to new entries
+   if(GetSpreadPoints() > MaximumSpread)
+      return;
+
+   //--- Get closed-candle CCI
+   double cciBuffer[1];
+
+   ArraySetAsSeries(cciBuffer, true);
+
+   if(CopyBuffer(cciHandle, 0, 1, 1, cciBuffer) != 1)
+   {
+      Print("WARNING: Unable to read CCI data.");
+      return;
+   }
+
+   //--- Get closed-candle ATR
+   double atrBuffer[1];
+
+   ArraySetAsSeries(atrBuffer, true);
+
+   if(CopyBuffer(atrHandle, 0, 1, 1, atrBuffer) != 1)
+   {
+      Print("WARNING: Unable to read ATR data.");
+      return;
+   }
+
+   double cciValue = cciBuffer[0];
+   double atrValue = atrBuffer[0];
+
+   if(!MathIsValidNumber(cciValue) ||
+      !MathIsValidNumber(atrValue) ||
+      atrValue <= 0.0)
+   {
+      return;
+   }
+
+   //--- Closed candle data
+   double openPrice  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   if(openPrice <= 0.0 || closePrice <= 0.0)
+      return;
+
+   //==============================================================
+   // BUY
+   // CCI <= Buy Level
+   // AND bullish closed candle
+   //==============================================================
+   if(cciValue <= CCI_Buy_Level &&
+      closePrice > openPrice)
+   {
+      OpenBuy(cciValue, atrValue);
+      return;
+   }
+
+   //==============================================================
+   // SELL
+   // CCI >= Sell Level
+   // AND bearish closed candle
+   //==============================================================
+   if(cciValue >= CCI_Sell_Level &&
+      closePrice < openPrice)
+   {
+      OpenSell(cciValue, atrValue);
+      return;
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Check whether our position exists                                |
+//+------------------------------------------------------------------+
+bool HasOurPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+
+//+------------------------------------------------------------------+
+//| Get our position ticket                                          |
+//+------------------------------------------------------------------+
+ulong GetOurPositionTicket()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic    = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return ticket;
+   }
+
+   return 0;
+}
+
+
+//+------------------------------------------------------------------+
+//| Manage existing position                                         |
+//+------------------------------------------------------------------+
+void ManageExistingPosition()
+{
+   ulong ticket = GetOurPositionTicket();
+
+   if(ticket == 0)
+      return;
+
+   if(!PositionSelectByTicket(ticket))
+      return;
+
+   datetime openTime =
+      (datetime)PositionGetInteger(POSITION_TIME);
+
+   if(openTime <= 0)
+      return;
+
+   //--- Number of completed candles since position was opened
+   int barsHeld = iBarShift(
+      _Symbol,
+      PERIOD_CURRENT,
+      openTime,
+      false
+   );
+
+   if(barsHeld < 0)
+      return;
+
+   if(barsHeld >= MaxHoldingBars)
+   {
+      if(!trade.PositionClose(ticket))
+      {
+         Print(
+            "MaxHoldingBars close failed. ",
+            "Ticket=", ticket,
+            " Retcode=", trade.ResultRetcode(),
+            " Description=", trade.ResultRetcodeDescription()
+         );
+      }
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Get current spread in points                                     |
+//+------------------------------------------------------------------+
+int GetSpreadPoints()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return 999999;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   if(point <= 0.0)
+      return 999999;
+
+   return (int)MathRound(
+      (tick.ask - tick.bid) / point
+   );
+}
+
+
+//+------------------------------------------------------------------+
+//| Normalize volume                                                 |
+//+------------------------------------------------------------------+
+double NormalizeVolume(double volume)
+{
+   double minVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MIN
+   );
+
+   double maxVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MAX
+   );
+
+   double stepVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_STEP
+   );
+
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      stepVolume <= 0.0)
+   {
+      return 0.0;
+   }
+
+   //--- Clamp to broker limits
+   volume = MathMax(volume, minVolume);
+   volume = MathMin(volume, maxVolume);
+
+   //--- Normalize to volume step
+   volume = MathFloor(
+      volume / stepVolume + 1e-8
+   ) * stepVolume;
+
+   //--- Re-check minimum
+   if(volume < minVolume)
+      volume = minVolume;
+
+   //--- Calculate volume precision
+   int volumeDigits = 0;
+   double tempStep = stepVolume;
+
+   while(volumeDigits < 8 &&
+         MathAbs(tempStep - MathRound(tempStep)) > 1e-8)
+   {
+      tempStep *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   int digits = (int)SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_DIGITS
+   );
+
+   return NormalizeDouble(price, digits);
+}
+
+
+//+------------------------------------------------------------------+
+//| Get minimum stop distance                                        |
+//+------------------------------------------------------------------+
+double GetMinimumStopDistance()
+{
+   double point = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_POINT
+   );
+
+   if(point <= 0.0)
+      return 0.0;
+
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   return (double)stopsLevel * point;
+}
+
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy(double cciValue, double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double entry = tick.ask;
+
+   if(entry <= 0.0)
+      return;
+
+   //--- ATR stop loss
+   double riskDistance =
+      atrValue * ATR_SL_Multiplier;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   //--- Respect broker minimum stop distance
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   if(riskDistance < minimumStopDistance)
+      riskDistance = minimumStopDistance;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   double sl = entry - riskDistance;
+   double tp = entry +
+               riskDistance * RiskRewardRatio;
+
+   //--- Normalize
+   entry = NormalizePrice(entry);
+   sl    = NormalizePrice(sl);
+   tp    = NormalizePrice(tp);
+
+   //--- Validate BUY structure
+   if(!(sl < entry && entry < tp))
+      return;
+
+   //--- Validate minimum distance after normalization
+   if((entry - sl) < minimumStopDistance)
+      sl = NormalizePrice(
+         entry - minimumStopDistance
+      );
+
+   if((tp - entry) < minimumStopDistance)
+      tp = NormalizePrice(
+         entry + minimumStopDistance
+      );
+
+   if(!(sl < entry && entry < tp))
+      return;
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return;
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "CCI Mean Reversion BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY failed | ",
+         "Entry=", entry,
+         " SL=", sl,
+         " TP=", tp,
+         " CCI=", cciValue,
+         " ATR=", atrValue,
+         " Retcode=", trade.ResultRetcode(),
+         " Description=", trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell(double cciValue, double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double entry = tick.bid;
+
+   if(entry <= 0.0)
+      return;
+
+   //--- ATR stop loss
+   double riskDistance =
+      atrValue * ATR_SL_Multiplier;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   //--- Respect broker minimum stop distance
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   if(riskDistance < minimumStopDistance)
+      riskDistance = minimumStopDistance;
+
+   if(riskDistance <= 0.0)
+      return;
+
+   double sl = entry + riskDistance;
+   double tp = entry -
+               riskDistance * RiskRewardRatio;
+
+   //--- Normalize
+   entry = NormalizePrice(entry);
+   sl    = NormalizePrice(sl);
+   tp    = NormalizePrice(tp);
+
+   //--- Validate SELL structure
+   if(!(tp < entry && entry < sl))
+      return;
+
+   //--- Validate minimum distance after normalization
+   if((sl - entry) < minimumStopDistance)
+      sl = NormalizePrice(
+         entry + minimumStopDistance
+      );
+
+   if((entry - tp) < minimumStopDistance)
+      tp = NormalizePrice(
+         entry - minimumStopDistance
+      );
+
+   if(!(tp < entry && entry < sl))
+      return;
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return;
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "CCI Mean Reversion SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL failed | ",
+         "Entry=", entry,
+         " SL=", sl,
+         " TP=", tp,
+         " CCI=", cciValue,
+         " ATR=", atrValue,
+         " Retcode=", trade.ResultRetcode(),
+         " Description=", trade.ResultRetcodeDescription()
+      );
+   }
+}
+//+------------------------------------------------------------------+

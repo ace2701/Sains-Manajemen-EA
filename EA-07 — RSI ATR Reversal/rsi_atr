@@ -1,0 +1,578 @@
+//+------------------------------------------------------------------+
+//|                                      EA-07 RSI ATR Reversal.mq5   |
+//|                         RSI + ATR Reversal Strategy               |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-07 RSI ATR Reversal - Closed Candle RSI Reversal with ATR Risk Management"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- Optimization inputs
+input int    RSI_Period          = 14;
+input double RSI_Buy_Level       = 30.0;
+input double RSI_Sell_Level      = 70.0;
+input int    ATR_Period          = 14;
+input double ATR_SL_Multiplier   = 2.0;
+input double RiskRewardRatio     = 1.5;
+input double FixedLotSize        = 0.01;
+input int    MaximumSpread       = 30;
+input long   MagicNumber         = 2026091307;
+
+//--- Indicator handles
+int rsiHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
+
+//--- New bar tracking
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate RSI settings
+   if(RSI_Period <= 0)
+   {
+      Print("Invalid RSI_Period.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RSI_Buy_Level <= 0.0 || RSI_Buy_Level >= 100.0)
+   {
+      Print("Invalid RSI_Buy_Level.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RSI_Sell_Level <= 0.0 || RSI_Sell_Level >= 100.0)
+   {
+      Print("Invalid RSI_Sell_Level.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RSI_Buy_Level >= RSI_Sell_Level)
+   {
+      Print("RSI_Buy_Level must be lower than RSI_Sell_Level.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Validate ATR settings
+   if(ATR_Period <= 0)
+   {
+      Print("Invalid ATR_Period.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATR_SL_Multiplier <= 0.0)
+   {
+      Print("ATR_SL_Multiplier must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("RiskRewardRatio must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(FixedLotSize <= 0.0)
+   {
+      Print("FixedLotSize must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MaximumSpread <= 0)
+   {
+      Print("MaximumSpread must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create RSI handle
+   rsiHandle = iRSI(
+      _Symbol,
+      PERIOD_CURRENT,
+      RSI_Period,
+      PRICE_CLOSE
+   );
+
+   if(rsiHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create RSI handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Create ATR handle
+   atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATR_Period
+   );
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR handle. Error: ", GetLastError());
+
+      IndicatorRelease(rsiHandle);
+      rsiHandle = INVALID_HANDLE;
+
+      return INIT_FAILED;
+   }
+
+   //--- Configure CTrade
+   trade.SetExpertMagicNumber((ulong)MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- Initialize current bar time
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(rsiHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(rsiHandle);
+      rsiHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Evaluate only once per new candle
+   if(!IsNewBar())
+      return;
+
+   //--- Ensure enough historical data
+   if(Bars(_Symbol, PERIOD_CURRENT) < 100)
+      return;
+
+   //--- Check that indicators have enough calculated data
+   if(BarsCalculated(rsiHandle) < RSI_Period + 3)
+      return;
+
+   if(BarsCalculated(atrHandle) < ATR_Period + 3)
+      return;
+
+   //--- Only one position for this EA on this symbol
+   if(HasOpenPosition())
+      return;
+
+   //--- Check spread before calculating/executing trade
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Get RSI value from closed candle (bar 1)
+   double rsiValues[2];
+   ArraySetAsSeries(rsiValues, true);
+
+   if(CopyBuffer(rsiHandle, 0, 0, 2, rsiValues) < 2)
+   {
+      Print("Failed to copy RSI data. Error: ", GetLastError());
+      return;
+   }
+
+   //--- Get ATR value from closed candle (bar 1)
+   double atrValues[2];
+   ArraySetAsSeries(atrValues, true);
+
+   if(CopyBuffer(atrHandle, 0, 0, 2, atrValues) < 2)
+   {
+      Print("Failed to copy ATR data. Error: ", GetLastError());
+      return;
+   }
+
+   //--- Closed candle data only
+   double openBar1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double closeBar1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double closeBar2 = iClose(_Symbol, PERIOD_CURRENT, 2);
+
+   if(openBar1 <= 0.0 || closeBar1 <= 0.0 || closeBar2 <= 0.0)
+      return;
+
+   double rsiBar1 = rsiValues[1];
+   double atrBar1 = atrValues[1];
+
+   if(atrBar1 <= 0.0)
+      return;
+
+   //--- BUY reversal condition
+   bool buySignal =
+      (rsiBar1 <= RSI_Buy_Level &&
+       closeBar1 > openBar1 &&
+       closeBar1 > closeBar2);
+
+   //--- SELL reversal condition
+   bool sellSignal =
+      (rsiBar1 >= RSI_Sell_Level &&
+       closeBar1 < openBar1 &&
+       closeBar1 < closeBar2);
+
+   //--- Execute only one possible direction
+   if(buySignal)
+   {
+      OpenBuy(atrBar1);
+   }
+   else if(sellSignal)
+   {
+      OpenSell(atrBar1);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect a new candle                                              |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(
+      _Symbol,
+      PERIOD_CURRENT,
+      0
+   );
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check maximum spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Failed to get current tick.");
+      return false;
+   }
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaximumSpread);
+}
+
+//+------------------------------------------------------------------+
+//| Check whether EA already has a position on this symbol          |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string positionSymbol =
+         PositionGetString(POSITION_SYMBOL);
+
+      long positionMagic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      if(positionSymbol == _Symbol &&
+         positionMagic == MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size according to broker specifications            |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(const double requestedLots)
+{
+   double minLot = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MIN
+   );
+
+   double maxLot = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MAX
+   );
+
+   double lotStep = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_STEP
+   );
+
+   if(minLot <= 0.0 ||
+      maxLot <= 0.0 ||
+      lotStep <= 0.0)
+   {
+      return 0.0;
+   }
+
+   double lots = requestedLots;
+
+   lots = MathMax(lots, minLot);
+   lots = MathMin(lots, maxLot);
+
+   //--- Normalize down to the broker volume step
+   lots = MathFloor(lots / lotStep) * lotStep;
+
+   //--- Determine volume precision
+   int volumeDigits = 0;
+   double step = lotStep;
+
+   while(step < 1.0 && volumeDigits < 8)
+   {
+      step *= 10.0;
+      volumeDigits++;
+   }
+
+   lots = NormalizeDouble(lots, volumeDigits);
+
+   //--- Safety check after normalization
+   if(lots < minLot)
+      lots = minLot;
+
+   if(lots > maxLot)
+      lots = maxLot;
+
+   return NormalizeDouble(lots, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Get broker minimum stop distance                                 |
+//+------------------------------------------------------------------+
+double GetMinimumStopDistance()
+{
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   if(stopsLevel < 0)
+      stopsLevel = 0;
+
+   return (double)stopsLevel * _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy(const double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("BUY failed: unable to obtain current tick.");
+      return;
+   }
+
+   double lotSize = NormalizeLotSize(FixedLotSize);
+
+   if(lotSize <= 0.0)
+   {
+      Print("BUY failed: invalid lot size.");
+      return;
+   }
+
+   //--- ATR based SL distance
+   double slDistance = atrValue * ATR_SL_Multiplier;
+
+   if(slDistance <= 0.0)
+   {
+      Print("BUY failed: invalid SL distance.");
+      return;
+   }
+
+   double entryPrice = tick.ask;
+
+   //--- Initial SL and TP
+   double stopLoss =
+      entryPrice - slDistance;
+
+   double takeProfit =
+      entryPrice + (slDistance * RiskRewardRatio);
+
+   //--- Broker minimum stop distance
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   if(minimumStopDistance > 0.0)
+   {
+      if((entryPrice - stopLoss) < minimumStopDistance)
+      {
+         stopLoss =
+            entryPrice - minimumStopDistance;
+      }
+
+      if((takeProfit - entryPrice) < minimumStopDistance)
+      {
+         takeProfit =
+            entryPrice + minimumStopDistance;
+      }
+   }
+
+   //--- Normalize prices
+   stopLoss = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Final validity check
+   if(stopLoss >= entryPrice)
+   {
+      Print("BUY failed: invalid Stop Loss.");
+      return;
+   }
+
+   if(takeProfit <= entryPrice)
+   {
+      Print("BUY failed: invalid Take Profit.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      lotSize,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-07 RSI ATR Reversal BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell(const double atrValue)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("SELL failed: unable to obtain current tick.");
+      return;
+   }
+
+   double lotSize = NormalizeLotSize(FixedLotSize);
+
+   if(lotSize <= 0.0)
+   {
+      Print("SELL failed: invalid lot size.");
+      return;
+   }
+
+   //--- ATR based SL distance
+   double slDistance = atrValue * ATR_SL_Multiplier;
+
+   if(slDistance <= 0.0)
+   {
+      Print("SELL failed: invalid SL distance.");
+      return;
+   }
+
+   double entryPrice = tick.bid;
+
+   //--- Initial SL and TP
+   double stopLoss =
+      entryPrice + slDistance;
+
+   double takeProfit =
+      entryPrice - (slDistance * RiskRewardRatio);
+
+   //--- Broker minimum stop distance
+   double minimumStopDistance =
+      GetMinimumStopDistance();
+
+   if(minimumStopDistance > 0.0)
+   {
+      if((stopLoss - entryPrice) < minimumStopDistance)
+      {
+         stopLoss =
+            entryPrice + minimumStopDistance;
+      }
+
+      if((entryPrice - takeProfit) < minimumStopDistance)
+      {
+         takeProfit =
+            entryPrice - minimumStopDistance;
+      }
+   }
+
+   //--- Normalize prices
+   stopLoss = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Final validity check
+   if(stopLoss <= entryPrice)
+   {
+      Print("SELL failed: invalid Stop Loss.");
+      return;
+   }
+
+   if(takeProfit >= entryPrice)
+   {
+      Print("SELL failed: invalid Take Profit.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      lotSize,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-07 RSI ATR Reversal SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL order failed. Retcode: ",
+         trade.ResultRetcode(),
+         " - ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+   }
+}
+//+------------------------------------------------------------------+

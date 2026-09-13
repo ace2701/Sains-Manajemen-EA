@@ -1,0 +1,937 @@
+#property strict
+#property version   "1.00"
+#property description "EA-19 - Commodity Channel Index (CCI) Trend Momentum"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input ulong  MagicNumber                  = 19019;
+input double FixedLotSize                 = 0.10;
+input int    MaximumAllowedSpreadPoints   = 50;
+
+//--- CCI
+input int    CCIPeriod                    = 20;
+input double BuyCCILevel                  = 100.0;
+input double SellCCILevel                 = -100.0;
+
+//--- EMA trend filter
+input bool   EnableEMAFilter              = true;
+input int    EMAPeriod                    = 50;
+
+//--- ATR risk management
+input int    ATRPeriod                    = 14;
+input double ATRStopMultiplier             = 1.5;
+input int    MinimumStopLossPoints        = 100;
+input int    MaximumStopLossPoints        = 600;
+input double RiskRewardRatio              = 1.5;
+
+//--- Trade management
+input bool   EnableOppositeSignalExit     = false;
+input bool   EnableTrailingStop            = false;
+
+//--- Trading hours
+input bool   EnableTradingHours            = false;
+input int    TradingStartHour              = 0;
+input int    TradingEndHour                = 23;
+
+//+------------------------------------------------------------------+
+//| Indicator handles                                                |
+//+------------------------------------------------------------------+
+int g_cciHandle = INVALID_HANDLE;
+int g_emaHandle = INVALID_HANDLE;
+int g_atrHandle = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| New candle tracking                                              |
+//+------------------------------------------------------------------+
+datetime g_lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(CCIPeriod < 2)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(EMAPeriod < 1)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(ATRPeriod < 1)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(ATRStopMultiplier <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(RiskRewardRatio <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MinimumStopLossPoints < 0 ||
+      MaximumStopLossPoints < MinimumStopLossPoints)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(FixedLotSize <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MaximumAllowedSpreadPoints < 0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(TradingStartHour < 0 || TradingStartHour > 23 ||
+      TradingEndHour < 0 || TradingEndHour > 23)
+      return INIT_PARAMETERS_INCORRECT;
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   //--- CCI
+   g_cciHandle = iCCI(
+      _Symbol,
+      PERIOD_CURRENT,
+      CCIPeriod,
+      PRICE_TYPICAL
+   );
+
+   if(g_cciHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   //--- EMA
+   if(EnableEMAFilter)
+   {
+      g_emaHandle = iMA(
+         _Symbol,
+         PERIOD_CURRENT,
+         EMAPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+      if(g_emaHandle == INVALID_HANDLE)
+         return INIT_FAILED;
+   }
+
+   //--- ATR
+   g_atrHandle = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATRPeriod
+   );
+
+   if(g_atrHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   //--- Initialize current bar
+   g_lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_cciHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_cciHandle);
+      g_cciHandle = INVALID_HANDLE;
+   }
+
+   if(g_emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_emaHandle);
+      g_emaHandle = INVALID_HANDLE;
+   }
+
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Manage an existing position on every tick
+   if(EnableTrailingStop)
+      ManageTrailingStop();
+
+   //--- Signals are evaluated only on a newly formed candle
+   if(!IsNewBar())
+      return;
+
+   //--- Make sure enough data is available
+   if(!HasEnoughData())
+      return;
+
+   //--- Calculate signals from closed candles
+   bool buySignal  = IsBuySignal();
+   bool sellSignal = IsSellSignal();
+
+   //--- Optional opposite-signal exit
+   if(EnableOppositeSignalExit)
+   {
+      if(buySignal)
+         ClosePositionsByType(POSITION_TYPE_SELL);
+
+      if(sellSignal)
+         ClosePositionsByType(POSITION_TYPE_BUY);
+   }
+
+   //--- Only one EA position per symbol
+   if(HasOpenPosition())
+      return;
+
+   //--- Spread filter
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Trading hours filter
+   if(!IsTradingHour())
+      return;
+
+   //--- Execute signal
+   if(buySignal)
+   {
+      OpenBuy();
+   }
+   else if(sellSignal)
+   {
+      OpenSell();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect newly formed candle                                        |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(g_lastBarTime == 0)
+   {
+      g_lastBarTime = currentBarTime;
+      return false;
+   }
+
+   if(currentBarTime != g_lastBarTime)
+   {
+      g_lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check data availability                                           |
+//+------------------------------------------------------------------+
+bool HasEnoughData()
+{
+   int requiredBars = CCIPeriod + 10;
+
+   if(EnableEMAFilter && EMAPeriod + 10 > requiredBars)
+      requiredBars = EMAPeriod + 10;
+
+   if(ATRPeriod + 10 > requiredBars)
+      requiredBars = ATRPeriod + 10;
+
+   if(Bars(_Symbol, PERIOD_CURRENT) < requiredBars)
+      return false;
+
+   if(g_cciHandle == INVALID_HANDLE ||
+      g_atrHandle == INVALID_HANDLE)
+      return false;
+
+   if(EnableEMAFilter && g_emaHandle == INVALID_HANDLE)
+      return false;
+
+   if(BarsCalculated(g_cciHandle) < 3)
+      return false;
+
+   if(BarsCalculated(g_atrHandle) < 2)
+      return false;
+
+   if(EnableEMAFilter && BarsCalculated(g_emaHandle) < 2)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get CCI values                                                    |
+//+------------------------------------------------------------------+
+bool GetCCIValues(double &cciClosed, double &cciPrevious)
+{
+   double buffer[3];
+
+   ArraySetAsSeries(buffer, true);
+
+   int copied = CopyBuffer(
+      g_cciHandle,
+      0,
+      0,
+      3,
+      buffer
+   );
+
+   if(copied < 3)
+      return false;
+
+   // buffer[0] = current forming candle
+   // buffer[1] = newly closed candle
+   // buffer[2] = candle before it
+   cciClosed   = buffer[1];
+   cciPrevious = buffer[2];
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get EMA value from closed candle                                  |
+//+------------------------------------------------------------------+
+bool GetEMAClosed(double &emaValue)
+{
+   double buffer[2];
+
+   ArraySetAsSeries(buffer, true);
+
+   int copied = CopyBuffer(
+      g_emaHandle,
+      0,
+      0,
+      2,
+      buffer
+   );
+
+   if(copied < 2)
+      return false;
+
+   emaValue = buffer[1];
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get ATR value from closed candle                                  |
+//+------------------------------------------------------------------+
+bool GetATRClosed(double &atrValue)
+{
+   double buffer[2];
+
+   ArraySetAsSeries(buffer, true);
+
+   int copied = CopyBuffer(
+      g_atrHandle,
+      0,
+      0,
+      2,
+      buffer
+   );
+
+   if(copied < 2)
+      return false;
+
+   atrValue = buffer[1];
+
+   return (atrValue > 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| BUY signal                                                        |
+//+------------------------------------------------------------------+
+bool IsBuySignal()
+{
+   double cciClosed;
+   double cciPrevious;
+
+   if(!GetCCIValues(cciClosed, cciPrevious))
+      return false;
+
+   //--- CCI crosses upward through positive threshold
+   if(cciPrevious > BuyCCILevel)
+      return false;
+
+   if(cciClosed <= BuyCCILevel)
+      return false;
+
+   //--- CCI momentum confirmation
+   if(cciClosed <= cciPrevious)
+      return false;
+
+   //--- Closed candle data
+   double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   if(open1 <= 0.0 || close1 <= 0.0)
+      return false;
+
+   //--- Bullish candle confirmation
+   if(close1 <= open1)
+      return false;
+
+   //--- EMA trend filter
+   if(EnableEMAFilter)
+   {
+      double emaValue;
+
+      if(!GetEMAClosed(emaValue))
+         return false;
+
+      if(close1 <= emaValue)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| SELL signal                                                       |
+//+------------------------------------------------------------------+
+bool IsSellSignal()
+{
+   double cciClosed;
+   double cciPrevious;
+
+   if(!GetCCIValues(cciClosed, cciPrevious))
+      return false;
+
+   //--- CCI crosses downward through negative threshold
+   if(cciPrevious < SellCCILevel)
+      return false;
+
+   if(cciClosed >= SellCCILevel)
+      return false;
+
+   //--- CCI momentum confirmation
+   if(cciClosed >= cciPrevious)
+      return false;
+
+   //--- Closed candle data
+   double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   if(open1 <= 0.0 || close1 <= 0.0)
+      return false;
+
+   //--- Bearish candle confirmation
+   if(close1 >= open1)
+      return false;
+
+   //--- EMA trend filter
+   if(EnableEMAFilter)
+   {
+      double emaValue;
+
+      if(!GetEMAClosed(emaValue))
+         return false;
+
+      if(close1 >= emaValue)
+         return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Spread filter                                                     |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   if(tick.ask <= 0.0 || tick.bid <= 0.0)
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaximumAllowedSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| Trading hours filter                                              |
+//+------------------------------------------------------------------+
+bool IsTradingHour()
+{
+   if(!EnableTradingHours)
+      return true;
+
+   MqlDateTime dt;
+
+   TimeToStruct(TimeCurrent(), dt);
+
+   int hour = dt.hour;
+
+   //--- Same hour
+   if(TradingStartHour == TradingEndHour)
+      return true;
+
+   //--- Normal session, e.g. 08 -> 17
+   if(TradingStartHour < TradingEndHour)
+   {
+      if(hour >= TradingStartHour && hour < TradingEndHour)
+         return true;
+
+      return false;
+   }
+
+   //--- Overnight session, e.g. 22 -> 06
+   if(hour >= TradingStartHour || hour < TradingEndHour)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position on this symbol        |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int total = PositionsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Close positions of a specified type                              |
+//+------------------------------------------------------------------+
+void ClosePositionsByType(const ENUM_POSITION_TYPE positionType)
+{
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+      ENUM_POSITION_TYPE type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      if(type != positionType)
+         continue;
+
+      bool result = trade.PositionClose(ticket);
+
+      if(!result || !IsTradeRetcodeSuccess())
+      {
+         Print(
+            "EA-19: Failed to close position #",
+            ticket,
+            ". Retcode=",
+            trade.ResultRetcode(),
+            " ",
+            trade.ResultRetcodeDescription()
+         );
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate stop-loss distance in points                            |
+//+------------------------------------------------------------------+
+double CalculateStopDistancePoints()
+{
+   double atrValue;
+
+   if(!GetATRClosed(atrValue))
+      return 0.0;
+
+   double atrPoints = atrValue / _Point;
+
+   double stopPoints = atrPoints * ATRStopMultiplier;
+
+   //--- User-defined minimum
+   if(stopPoints < (double)MinimumStopLossPoints)
+      stopPoints = (double)MinimumStopLossPoints;
+
+   //--- User-defined maximum
+   if(MaximumStopLossPoints > 0 &&
+      stopPoints > (double)MaximumStopLossPoints)
+      stopPoints = (double)MaximumStopLossPoints;
+
+   //--- Broker minimum stop distance
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double brokerMinimum = (double)stopsLevel;
+
+   if(stopPoints < brokerMinimum)
+      stopPoints = brokerMinimum;
+
+   //--- Add a small safety margin when broker requires a stop level
+   if(brokerMinimum > 0.0)
+      stopPoints += 1.0;
+
+   return stopPoints;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate valid volume                                            |
+//+------------------------------------------------------------------+
+double NormalizeVolume(const double requestedVolume)
+{
+   double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volumeMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(volumeMin <= 0.0 || volumeMax <= 0.0 || volumeStep <= 0.0)
+      return 0.0;
+
+   double volume = requestedVolume;
+
+   if(volume < volumeMin)
+      volume = volumeMin;
+
+   if(volume > volumeMax)
+      volume = volumeMax;
+
+   volume = MathFloor((volume / volumeStep) + 0.5) * volumeStep;
+
+   if(volume < volumeMin)
+      volume = volumeMin;
+
+   if(volume > volumeMax)
+      volume = volumeMax;
+
+   int digits = 0;
+   double step = volumeStep;
+
+   while(digits < 8 && MathAbs(step - MathRound(step)) > 0.00000001)
+   {
+      step *= 10.0;
+      digits++;
+   }
+
+   return NormalizeDouble(volume, digits);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price                                                   |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   int digits = (int)SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_DIGITS
+   );
+
+   return NormalizeDouble(price, digits);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                          |
+//+------------------------------------------------------------------+
+void OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double stopPoints = CalculateStopDistancePoints();
+
+   if(stopPoints <= 0.0)
+      return;
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return;
+
+   double entryPrice = tick.ask;
+
+   double slDistance = stopPoints * _Point;
+   double tpDistance = slDistance * RiskRewardRatio;
+
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumBrokerDistance =
+      (double)stopsLevel * _Point;
+
+   if(slDistance < minimumBrokerDistance)
+      slDistance = minimumBrokerDistance + _Point;
+
+   if(tpDistance < minimumBrokerDistance)
+      tpDistance = minimumBrokerDistance + _Point;
+
+   double sl = NormalizePrice(entryPrice - slDistance);
+   double tp = NormalizePrice(entryPrice + tpDistance);
+
+   if(sl <= 0.0 || tp <= 0.0)
+      return;
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "EA-19 CCI Trend Momentum"
+   );
+
+   if(!result || !IsTradeRetcodeSuccess())
+   {
+      Print(
+         "EA-19 BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " ",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                         |
+//+------------------------------------------------------------------+
+void OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double stopPoints = CalculateStopDistancePoints();
+
+   if(stopPoints <= 0.0)
+      return;
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+      return;
+
+   double entryPrice = tick.bid;
+
+   double slDistance = stopPoints * _Point;
+   double tpDistance = slDistance * RiskRewardRatio;
+
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumBrokerDistance =
+      (double)stopsLevel * _Point;
+
+   if(slDistance < minimumBrokerDistance)
+      slDistance = minimumBrokerDistance + _Point;
+
+   if(tpDistance < minimumBrokerDistance)
+      tpDistance = minimumBrokerDistance + _Point;
+
+   double sl = NormalizePrice(entryPrice + slDistance);
+   double tp = NormalizePrice(entryPrice - tpDistance);
+
+   if(sl <= 0.0 || tp <= 0.0)
+      return;
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      sl,
+      tp,
+      "EA-19 CCI Trend Momentum"
+   );
+
+   if(!result || !IsTradeRetcodeSuccess())
+   {
+      Print(
+         "EA-19 SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " ",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ATR trailing stop management                                     |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   double atrValue;
+
+   if(!GetATRClosed(atrValue))
+      return;
+
+   if(atrValue <= 0.0)
+      return;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      ((double)stopsLevel + 1.0) * _Point;
+
+   double trailingDistance = atrValue * ATRStopMultiplier;
+
+   if(trailingDistance < minimumDistance)
+      trailingDistance = minimumDistance;
+
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      double currentSL =
+         PositionGetDouble(POSITION_SL);
+
+      double currentTP =
+         PositionGetDouble(POSITION_TP);
+
+      double newSL = currentSL;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         //--- Only trail a profitable BUY
+         if(tick.bid <= PositionGetDouble(POSITION_PRICE_OPEN))
+            continue;
+
+         newSL = tick.bid - trailingDistance;
+         newSL = NormalizePrice(newSL);
+
+         if(newSL <= 0.0)
+            continue;
+
+         //--- Never move SL backward
+         if(currentSL > 0.0 && newSL <= currentSL)
+            continue;
+
+         //--- Ensure broker distance
+         if((tick.bid - newSL) < minimumDistance)
+            continue;
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         //--- Only trail a profitable SELL
+         if(tick.ask >= PositionGetDouble(POSITION_PRICE_OPEN))
+            continue;
+
+         newSL = tick.ask + trailingDistance;
+         newSL = NormalizePrice(newSL);
+
+         if(newSL <= 0.0)
+            continue;
+
+         //--- Never move SL backward
+         if(currentSL > 0.0 && newSL >= currentSL)
+            continue;
+
+         //--- Ensure broker distance
+         if((newSL - tick.ask) < minimumDistance)
+            continue;
+      }
+      else
+      {
+         continue;
+      }
+
+      bool result = trade.PositionModify(
+         ticket,
+         newSL,
+         currentTP
+      );
+
+      if(!result || !IsTradeRetcodeSuccess())
+      {
+         Print(
+            "EA-19 trailing stop modification failed for #",
+            ticket,
+            ". Retcode=",
+            trade.ResultRetcode(),
+            " ",
+            trade.ResultRetcodeDescription()
+         );
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check successful trade return codes                               |
+//+------------------------------------------------------------------+
+bool IsTradeRetcodeSuccess()
+{
+   uint retcode = trade.ResultRetcode();
+
+   if(retcode == TRADE_RETCODE_DONE)
+      return true;
+
+   if(retcode == TRADE_RETCODE_DONE_PARTIAL)
+      return true;
+
+   if(retcode == TRADE_RETCODE_PLACED)
+      return true;
+
+   return false;
+}
+//+------------------------------------------------------------------+

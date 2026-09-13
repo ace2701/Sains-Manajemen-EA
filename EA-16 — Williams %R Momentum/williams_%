@@ -1,0 +1,934 @@
+//+------------------------------------------------------------------+
+//|                                             EA-16_WPR_Momentum.mq5 |
+//|                         Williams %R Momentum Expert Advisor       |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-16 - Williams %R Momentum"
+#property description "Active H1 momentum strategy using Williams %R, optional EMA filter and ATR risk management."
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//====================================================================
+// GENERAL
+//====================================================================
+input group "=== GENERAL ==="
+input long   MagicNumber = 16016;
+input double FixedLotSize = 0.10;
+input int    MaximumAllowedSpreadPoints = 50;
+
+//====================================================================
+// WILLIAMS %R
+// Optimization: WPRPeriod 8 / 2 / 24
+// Optimization: OverboughtLevel -30 / 5 / -15
+// Optimization: OversoldLevel -85 / 5 / -65
+//====================================================================
+input group "=== WILLIAMS %R ==="
+input int    WPRPeriod = 14;
+input double OverboughtLevel = -20.0;
+input double OversoldLevel = -80.0;
+
+//====================================================================
+// EMA FILTER
+// Optimization: EMAPeriod 20 / 10 / 100
+//====================================================================
+input group "=== EMA FILTER ==="
+input bool   EnableEMAFilter = true;
+input int    EMAPeriod = 50;
+
+//====================================================================
+// ATR RISK
+// Optimization: ATRPeriod 10 / 2 / 20
+// Optimization: ATRStopMultiplier 1.0 / 0.25 / 2.5
+// Optimization: MinimumStopLossPoints 50 / 25 / 200
+// Optimization: MaximumStopLossPoints 300 / 50 / 800
+//====================================================================
+input group "=== ATR RISK ==="
+input int    ATRPeriod = 14;
+input double ATRStopMultiplier = 1.5;
+input int    MinimumStopLossPoints = 100;
+input int    MaximumStopLossPoints = 500;
+
+//====================================================================
+// TAKE PROFIT
+// Optimization: RiskRewardRatio 1.0 / 0.25 / 2.5
+//====================================================================
+input group "=== TAKE PROFIT ==="
+input double RiskRewardRatio = 1.5;
+
+//====================================================================
+// EXIT
+//====================================================================
+input group "=== EXIT ==="
+input bool   EnableWPRExit = false;
+
+//====================================================================
+// TRADING HOURS
+//====================================================================
+input group "=== TRADING HOURS ==="
+input bool   EnableTradingHours = false;
+input int    TradingStartHour = 0;
+input int    TradingEndHour = 23;
+
+//====================================================================
+// INDICATOR HANDLES
+//====================================================================
+int wprHandle = INVALID_HANDLE;
+int emaHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
+
+//====================================================================
+// STATE
+//====================================================================
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate inputs
+   if(MagicNumber <= 0)
+   {
+      Print("ERROR: MagicNumber must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(FixedLotSize <= 0.0)
+   {
+      Print("ERROR: FixedLotSize must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(WPRPeriod < 2)
+   {
+      Print("ERROR: WPRPeriod must be at least 2.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(OverboughtLevel <= OversoldLevel)
+   {
+      Print("ERROR: OverboughtLevel must be greater than OversoldLevel.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(EMAPeriod < 1)
+   {
+      Print("ERROR: EMAPeriod must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATRPeriod < 1)
+   {
+      Print("ERROR: ATRPeriod must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(ATRStopMultiplier <= 0.0)
+   {
+      Print("ERROR: ATRStopMultiplier must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MinimumStopLossPoints <= 0 ||
+      MaximumStopLossPoints < MinimumStopLossPoints)
+   {
+      Print("ERROR: Invalid stop-loss point limits.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(RiskRewardRatio <= 0.0)
+   {
+      Print("ERROR: RiskRewardRatio must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(MaximumAllowedSpreadPoints < 0)
+   {
+      Print("ERROR: MaximumAllowedSpreadPoints cannot be negative.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(TradingStartHour < 0 || TradingStartHour > 23 ||
+      TradingEndHour < 0 || TradingEndHour > 23)
+   {
+      Print("ERROR: Trading hours must be between 0 and 23.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   //--- Create Williams %R handle
+   wprHandle = iWPR(_Symbol, PERIOD_CURRENT, WPRPeriod);
+
+   if(wprHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create Williams %R handle. Error: ",
+            GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Create EMA handle
+   if(EnableEMAFilter)
+   {
+      emaHandle = iMA(
+         _Symbol,
+         PERIOD_CURRENT,
+         EMAPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+      if(emaHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to create EMA handle. Error: ",
+               GetLastError());
+         return INIT_FAILED;
+      }
+   }
+
+   //--- Create ATR handle
+   atrHandle = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR handle. Error: ",
+            GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber((ulong)MagicNumber);
+   trade.SetDeviationInPoints(20);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- Initialize new-bar state
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   Print("EA-16 - Williams %R Momentum initialized successfully.");
+   Print("Symbol: ", _Symbol,
+         " | Timeframe: ", EnumToString((ENUM_TIMEFRAMES)Period()),
+         " | Magic: ", MagicNumber);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(wprHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(wprHandle);
+      wprHandle = INVALID_HANDLE;
+   }
+
+   if(emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(emaHandle);
+      emaHandle = INVALID_HANDLE;
+   }
+
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
+
+   Print("EA-16 deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Only process once per newly formed candle
+   if(!IsNewBar())
+      return;
+
+   //--- Make sure sufficient market data exists
+   if(!HasSufficientBars())
+      return;
+
+   //--- Manage existing positions regardless of trading hours
+   if(EnableWPRExit)
+   {
+      ManageWPRExit();
+   }
+
+   //--- Never create another position if this EA already has one
+   if(HasOpenPosition())
+      return;
+
+   //--- New positions are restricted by trading hours if enabled
+   if(!IsTradingHour())
+      return;
+
+   //--- Spread protection
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Evaluate the closed-candle signal
+   CheckForEntry();
+}
+
+//+------------------------------------------------------------------+
+//| Detect newly formed candle                                       |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Validate sufficient historical data                               |
+//+------------------------------------------------------------------+
+bool HasSufficientBars()
+{
+   int requiredBars = WPRPeriod + 10;
+
+   if(EnableEMAFilter && EMAPeriod + 10 > requiredBars)
+      requiredBars = EMAPeriod + 10;
+
+   if(ATRPeriod + 10 > requiredBars)
+      requiredBars = ATRPeriod + 10;
+
+   int availableBars = Bars(_Symbol, PERIOD_CURRENT);
+
+   if(availableBars < requiredBars)
+      return false;
+
+   if(BarsCalculated(wprHandle) < 3)
+      return false;
+
+   if(BarsCalculated(atrHandle) < 2)
+      return false;
+
+   if(EnableEMAFilter && BarsCalculated(emaHandle) < 2)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check trading hours                                              |
+//+------------------------------------------------------------------+
+bool IsTradingHour()
+{
+   if(!EnableTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   //--- Same start/end hour means that hour is allowed
+   if(TradingStartHour == TradingEndHour)
+      return (hour == TradingStartHour);
+
+   //--- Normal intraday session
+   if(TradingStartHour < TradingEndHour)
+   {
+      return (hour >= TradingStartHour &&
+              hour <= TradingEndHour);
+   }
+
+   //--- Overnight session, e.g. 22 -> 5
+   return (hour >= TradingStartHour ||
+           hour <= TradingEndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Check current spread                                             |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("ERROR: Unable to obtain current tick. Error: ",
+            GetLastError());
+      return false;
+   }
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   if(spreadPoints > (double)MaximumAllowedSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA has an open position on this symbol        |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Williams %R entry signal                                   |
+//+------------------------------------------------------------------+
+void CheckForEntry()
+{
+   double wprValues[2];
+
+   ArraySetAsSeries(wprValues, false);
+
+   // CopyBuffer start position 1:
+   // wprValues[0] = candle [1]
+   // wprValues[1] = candle [2]
+   int copiedWPR = CopyBuffer(
+      wprHandle,
+      0,
+      1,
+      2,
+      wprValues
+   );
+
+   if(copiedWPR != 2)
+   {
+      Print("ERROR: Unable to read Williams %R data. Copied: ",
+            copiedWPR,
+            " Error: ",
+            GetLastError());
+      return;
+   }
+
+   double wpr1 = wprValues[0];
+   double wpr2 = wprValues[1];
+
+   //--- Closed candle price
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   if(close1 <= 0.0)
+      return;
+
+   //--- Optional EMA filter
+   double ema1 = 0.0;
+
+   if(EnableEMAFilter)
+   {
+      double emaValues[1];
+
+      ArraySetAsSeries(emaValues, false);
+
+      int copiedEMA = CopyBuffer(
+         emaHandle,
+         0,
+         1,
+         1,
+         emaValues
+      );
+
+      if(copiedEMA != 1)
+      {
+         Print("ERROR: Unable to read EMA data. Copied: ",
+               copiedEMA,
+               " Error: ",
+               GetLastError());
+         return;
+      }
+
+      ema1 = emaValues[0];
+
+      if(ema1 <= 0.0)
+         return;
+   }
+
+   //--- BUY:
+   // Candle [2] at/below oversold
+   // Candle [1] crosses upward above oversold
+   bool buySignal =
+      (wpr2 <= OversoldLevel &&
+       wpr1 > OversoldLevel);
+
+   //--- SELL:
+   // Candle [2] at/above overbought
+   // Candle [1] crosses downward below overbought
+   bool sellSignal =
+      (wpr2 >= OverboughtLevel &&
+       wpr1 < OverboughtLevel);
+
+   //--- Optional trend confirmation
+   if(EnableEMAFilter)
+   {
+      buySignal = buySignal && (close1 > ema1);
+      sellSignal = sellSignal && (close1 < ema1);
+   }
+
+   //--- Execute only one direction
+   if(buySignal)
+   {
+      OpenBuy();
+      return;
+   }
+
+   if(sellSignal)
+   {
+      OpenSell();
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get ATR-based stop distance in points                            |
+//+------------------------------------------------------------------+
+double GetStopDistancePoints()
+{
+   double atrValues[1];
+
+   ArraySetAsSeries(atrValues, false);
+
+   int copiedATR = CopyBuffer(
+      atrHandle,
+      0,
+      1,
+      1,
+      atrValues
+   );
+
+   if(copiedATR != 1)
+   {
+      Print("ERROR: Unable to read ATR data. Copied: ",
+            copiedATR,
+            " Error: ",
+            GetLastError());
+      return 0.0;
+   }
+
+   double atrValue = atrValues[0];
+
+   if(atrValue <= 0.0)
+      return 0.0;
+
+   double atrStopPoints =
+      (atrValue * ATRStopMultiplier) / _Point;
+
+   //--- Apply user-defined stop range
+   double stopPoints = atrStopPoints;
+
+   if(stopPoints < (double)MinimumStopLossPoints)
+      stopPoints = (double)MinimumStopLossPoints;
+
+   if(stopPoints > (double)MaximumStopLossPoints)
+      stopPoints = (double)MaximumStopLossPoints;
+
+   //--- Broker minimum stop distance
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double brokerMinimumPoints = (double)stopsLevel;
+
+   if(stopPoints < brokerMinimumPoints)
+      stopPoints = brokerMinimumPoints;
+
+   //--- Add one point for safe broker-side rounding
+   if(stopPoints < brokerMinimumPoints + 1.0)
+      stopPoints = brokerMinimumPoints + 1.0;
+
+   return stopPoints;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize trade volume                                            |
+//+------------------------------------------------------------------+
+double NormalizeVolume(double requestedVolume)
+{
+   double minVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MIN
+   );
+
+   double maxVolume = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_MAX
+   );
+
+   double volumeStep = SymbolInfoDouble(
+      _Symbol,
+      SYMBOL_VOLUME_STEP
+   );
+
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      volumeStep <= 0.0)
+   {
+      return 0.0;
+   }
+
+   double volume = requestedVolume;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   if(volume > maxVolume)
+      volume = maxVolume;
+
+   volume = MathFloor(volume / volumeStep) * volumeStep;
+
+   if(volume < minVolume)
+      volume = minVolume;
+
+   int volumeDigits = 0;
+   double stepCheck = volumeStep;
+
+   while(volumeDigits < 8 &&
+         MathAbs(stepCheck - MathRound(stepCheck)) > 0.00000001)
+   {
+      stepCheck *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY                                                         |
+//+------------------------------------------------------------------+
+void OpenBuy()
+{
+   if(HasOpenPosition())
+      return;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("BUY ERROR: Unable to obtain market tick. Error: ",
+            GetLastError());
+      return;
+   }
+
+   double stopPoints = GetStopDistancePoints();
+
+   if(stopPoints <= 0.0)
+      return;
+
+   double entryPrice = tick.ask;
+
+   if(entryPrice <= 0.0)
+      return;
+
+   double riskDistance = stopPoints * _Point;
+
+   double stopLoss = entryPrice - riskDistance;
+   double takeProfit =
+      entryPrice + (riskDistance * RiskRewardRatio);
+
+   //--- Normalize prices
+   stopLoss = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Final broker stop validation
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      (double)stopsLevel * _Point;
+
+   if((entryPrice - stopLoss) < minimumDistance)
+   {
+      stopLoss =
+         NormalizeDouble(
+            entryPrice - minimumDistance - _Point,
+            _Digits
+         );
+   }
+
+   if((takeProfit - entryPrice) < minimumDistance)
+   {
+      takeProfit =
+         NormalizeDouble(
+            entryPrice + minimumDistance + _Point,
+            _Digits
+         );
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("BUY ERROR: Invalid normalized volume.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Buy(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-16 WPR BUY"
+   );
+
+   if(!result)
+   {
+      Print(
+         "BUY FAILED | Retcode: ",
+         trade.ResultRetcode(),
+         " | Description: ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+      return;
+   }
+
+   Print(
+      "BUY OPENED | Volume: ",
+      DoubleToString(volume, 2),
+      " | Entry: ",
+      DoubleToString(trade.ResultPrice(), _Digits),
+      " | SL: ",
+      DoubleToString(stopLoss, _Digits),
+      " | TP: ",
+      DoubleToString(takeProfit, _Digits)
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL                                                        |
+//+------------------------------------------------------------------+
+void OpenSell()
+{
+   if(HasOpenPosition())
+      return;
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("SELL ERROR: Unable to obtain market tick. Error: ",
+            GetLastError());
+      return;
+   }
+
+   double stopPoints = GetStopDistancePoints();
+
+   if(stopPoints <= 0.0)
+      return;
+
+   double entryPrice = tick.bid;
+
+   if(entryPrice <= 0.0)
+      return;
+
+   double riskDistance = stopPoints * _Point;
+
+   double stopLoss = entryPrice + riskDistance;
+   double takeProfit =
+      entryPrice - (riskDistance * RiskRewardRatio);
+
+   //--- Normalize prices
+   stopLoss = NormalizeDouble(stopLoss, _Digits);
+   takeProfit = NormalizeDouble(takeProfit, _Digits);
+
+   //--- Final broker stop validation
+   long stopsLevel = SymbolInfoInteger(
+      _Symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   double minimumDistance =
+      (double)stopsLevel * _Point;
+
+   if((stopLoss - entryPrice) < minimumDistance)
+   {
+      stopLoss =
+         NormalizeDouble(
+            entryPrice + minimumDistance + _Point,
+            _Digits
+         );
+   }
+
+   if((entryPrice - takeProfit) < minimumDistance)
+   {
+      takeProfit =
+         NormalizeDouble(
+            entryPrice - minimumDistance - _Point,
+            _Digits
+         );
+   }
+
+   double volume = NormalizeVolume(FixedLotSize);
+
+   if(volume <= 0.0)
+   {
+      Print("SELL ERROR: Invalid normalized volume.");
+      return;
+   }
+
+   ResetLastError();
+
+   bool result = trade.Sell(
+      volume,
+      _Symbol,
+      0.0,
+      stopLoss,
+      takeProfit,
+      "EA-16 WPR SELL"
+   );
+
+   if(!result)
+   {
+      Print(
+         "SELL FAILED | Retcode: ",
+         trade.ResultRetcode(),
+         " | Description: ",
+         trade.ResultRetcodeDescription(),
+         " | Error: ",
+         GetLastError()
+      );
+      return;
+   }
+
+   Print(
+      "SELL OPENED | Volume: ",
+      DoubleToString(volume, 2),
+      " | Entry: ",
+      DoubleToString(trade.ResultPrice(), _Digits),
+      " | SL: ",
+      DoubleToString(stopLoss, _Digits),
+      " | TP: ",
+      DoubleToString(takeProfit, _Digits)
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Williams %R exit management                                      |
+//+------------------------------------------------------------------+
+void ManageWPRExit()
+{
+   double wprValues[1];
+
+   ArraySetAsSeries(wprValues, false);
+
+   int copiedWPR = CopyBuffer(
+      wprHandle,
+      0,
+      1,
+      1,
+      wprValues
+   );
+
+   if(copiedWPR != 1)
+   {
+      Print("WPR EXIT ERROR: Unable to read Williams %R. Error: ",
+            GetLastError());
+      return;
+   }
+
+   double wpr1 = wprValues[0];
+
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      bool closePosition = false;
+
+      //--- BUY exits at overbought zone
+      if(positionType == POSITION_TYPE_BUY &&
+         wpr1 >= OverboughtLevel)
+      {
+         closePosition = true;
+      }
+
+      //--- SELL exits at oversold zone
+      if(positionType == POSITION_TYPE_SELL &&
+         wpr1 <= OversoldLevel)
+      {
+         closePosition = true;
+      }
+
+      if(!closePosition)
+         continue;
+
+      ResetLastError();
+
+      bool result = trade.PositionClose(ticket);
+
+      if(!result)
+      {
+         Print(
+            "WPR EXIT FAILED | Ticket: ",
+            ticket,
+            " | Retcode: ",
+            trade.ResultRetcode(),
+            " | Description: ",
+            trade.ResultRetcodeDescription(),
+            " | Error: ",
+            GetLastError()
+         );
+      }
+      else
+      {
+         Print(
+            "WPR EXIT SUCCESS | Ticket: ",
+            ticket,
+            " | WPR: ",
+            DoubleToString(wpr1, 2)
+         );
+      }
+   }
+}
+//+------------------------------------------------------------------+
